@@ -1,0 +1,228 @@
+"""Cross-component wire-contract allow-lists.
+
+The Phase 6 §6.4 boundary test originally asserted that
+``maint.event.v1`` had ``producers == {drift.v1}``. Phase 7 §7.3
+expands the producer set to include ``ops_console`` (the Phase 8
+maint surface) so operators can clear denylists, reset upstream
+baselines, etc. via the same envelope. The contract change belongs
+to whichever phase first needs the second producer — that's Phase 7
+via the §7.3 consumer hook on ``sec.rate.v1``.
+
+This module is the single source of truth for that allow-list (and
+any future cross-component allow-list of the same shape). The
+boundary tests import the constant; the producers do NOT — producer
+identity is enforced by AST scan over Python source + the agent
+``publishes`` declaration, not at runtime (matches the open-enum
+producer-side discipline pattern).
+
+Doctrine: append-only. Adding a producer is a minor bump on the
+``swarm`` component; never silently widen the set. Removing a
+producer requires a migration plan because some consumer is almost
+certainly depending on the producer's emissions.
+"""
+from __future__ import annotations
+
+from typing import FrozenSet, Mapping
+
+
+# `maint.event.v1` producers (ROADMAP §7.3 cross-phase note).
+#
+# Members:
+#   * ``drift.v1`` — Phase 6.3, kind=retrain_request when a rolling
+#     Brier / log-loss / KS-test trips.
+#   * ``ops_console`` — Phase 8 maint surface. Operators send
+#     ``kind=denylist_clear`` (Phase 7.3 consumer: ``sec.rate.v1``)
+#     and ``kind=baseline_reset`` (Phase 7.2 consumer:
+#     ``sec.scrape.v1``). The ``ops_console`` name is the
+#     `producer` field on the envelope; there is no Python agent
+#     class with this name (humans publish via a CLI).
+#
+# Future additions land here with a tracker row + minor bump. The
+# boundary test in ``test_boundary_discipline.py`` asserts producers
+# in production code are a subset of this set.
+MAINT_EVENT_V1_ALLOWED_PRODUCERS: FrozenSet[str] = frozenset({
+    "drift.v1",
+    "ops_console",
+    # Phase 8 self-maintenance reactors. Each emits notifications on
+    # `maint.event.v1` (the bus's "maintenance happened" channel):
+    #   * ``maint.scaler.v1``  — scale_decision / scale_throttled /
+    #                            manual_scale_pin_expired
+    #   * ``maint.dlq.v1``      — dlq_replayed (and dlq_replay_throttled)
+    #   * ``maint.schema.v1``   — schema_drift_detected
+    #   * ``maint.sec.v1``      — pattern_allowlist_pending /
+    #                             pattern_allowlist_added /
+    #                             pattern_allowlist_expired /
+    #                             denylist_decimate / denylist_cap_cleared
+    #   * ``source.watcher.v1`` — schema_drift_detected (source-side)
+    "maint.scaler.v1",
+    "maint.dlq.v1",
+    "maint.schema.v1",
+    "maint.sec.v1",
+    "maint.backup.v1",
+    "source.watcher.v1",
+    # Phase 8 §8.16.10 — sec.input.v1 emits notification-only
+    # pattern_allowlist_legacy_hit on legacy SHA row matches.
+    "sec.input.v1",
+    # Phase 8 §8.9: dead-man relay — telemetry.v1 may publish
+    # maint.event.v1 audit rows; its sec.alert.v1 kind is further
+    # constrained by SEC_ALERT_V1_ALLOWED_KINDS_BY_PRODUCER below.
+    "telemetry.v1",
+})
+
+
+# `sec.config.v1` producers (ROADMAP §7.1 cross-pod fan-out).
+#
+# Members:
+#   * ``sec.input.v1`` — emits when its mtime poller detects a
+#     local change, so sibling replicas re-read the file
+#     immediately rather than waiting for their own poll tick.
+#   * ``sec.scrape.v1`` — same pattern for the (future) scrape-side
+#     allowlist; reserved so the agent can join the producer set
+#     without a separate doctrine rev.
+#   * ``ops_console`` — Phase 8 maint surface. Operators publish
+#     when they edit the YAML out-of-band (e.g. via a sealed
+#     ConfigMap rotation); the announcement triggers immediate
+#     reload across all sec.input.v1 / gateway replicas.
+#
+# Doctrine: append-only. Adding a producer is a minor bump on
+# `swarm`. Consumers tolerate unknown producers (the sha256 is the
+# contract); the allow-list is the AST-scan boundary test.
+SEC_CONFIG_V1_ALLOWED_PRODUCERS: FrozenSet[str] = frozenset({
+    "sec.input.v1",
+    "sec.scrape.v1",
+    "ops_console",
+})
+
+
+# `sec.alert.v1` producers (ROADMAP §7.4 open-enum + §8.9 boundary).
+#
+# Producers are bounded to sec.* and maint.* control-plane surfaces,
+# plus the source-watcher summarizer and telemetry's dead-man relay.
+# Additions are append-only with a tracker row + minor bump.
+SEC_ALERT_V1_ALLOWED_PRODUCERS: FrozenSet[str] = frozenset({
+    "sec.input.v1",
+    "sec.scrape.v1",
+    "sec.rate.v1",
+    "maint.deadmans.v1",
+    "maint.dlq.v1",
+    "maint.scaler.v1",
+    "maint.schema.v1",
+    "maint.backup.v1",
+    "maint.storage.v1",
+    "source.watcher.v1",
+    "telemetry.v1",
+    # §8.14.6 — ops_console emits maint_ack_legacy_schema when it
+    # receives a maint.ack.v1 with schema_version=1 (legacy producer).
+    "ops_console",
+})
+
+
+# Per-producer kind pins for sec.alert.v1 (only producers listed here
+# are constrained; all others use the global KNOWN_SEC_ALERT_KINDS gate).
+SEC_ALERT_V1_ALLOWED_KINDS_BY_PRODUCER: Mapping[str, FrozenSet[str]] = {
+    # Phase 8 §8.9: telemetry may only relay the dead-man silence alert.
+    "telemetry.v1": frozenset({"maint_silence_alert"}),
+    # Phase 8 §8.14.6: ops_console may emit the legacy-schema nudge and
+    # Phase 10 §10.27 operator kill-pattern arm audit alert.
+    "ops_console": frozenset({"maint_ack_legacy_schema", "nlp_kill_pattern_armed"}),
+}
+
+
+# `api.request.v1` + `api.response.v1` producers (Phase 9 §9.0
+# wire-authority delta).
+#
+# The Go API gateway (``api.gateway.v1``) is the SOLE producer for
+# both topics.  No Python swarm agent may ever publish to the
+# api.request/response audit stream.  The constant lives here so the
+# boundary test can import it and assert the invariant.
+#
+# Consumers (open enum per §9.0): ``telemetry.v1``, ``audit.v1``
+# (Phase 8 §8.13.2 hash-chain mirror, not yet in the Python swarm
+# registry), future Phase 19 SLO consumers.  The consumer set is NOT
+# pinned here — consumers are free to grow; only the producer set is
+# locked.
+API_TOPIC_V1_ALLOWED_PRODUCERS: FrozenSet[str] = frozenset({
+    "api.gateway.v1",
+})
+
+
+# `predict.cancel.v1` producers (Phase 9 §9.5 wire-authority delta).
+#
+# The Go API gateway (``api.gateway.v1``) is the SOLE producer.
+# No Python swarm agent may ever publish to this topic.  The constant
+# lives here so the boundary test can import it and assert the
+# invariant alongside the sibling ``API_TOPIC_V1_ALLOWED_PRODUCERS``
+# constant above.
+PREDICT_CANCEL_V1_ALLOWED_PRODUCERS: FrozenSet[str] = frozenset({
+    "api.gateway.v1",
+})
+
+
+# `nlp.event.v1` producers (Phase 10 §10.0 wire-authority).
+#
+# Bounded to NLP-plane agents only. Additions require a tracker row +
+# minor bump on `ai`. NLP must NEVER widen this set to include sec.*,
+# maint.*, auth.*, payment.*, or patcher.* agents (§10.0 boundary
+# discipline, AST-asserted in §10.20 boundary test).
+#
+# Members:
+#   * ``nlp.intent.v1``      — normalizes + classifies intent + extracts
+#     entities; emits kinds: intent_classifier_degraded,
+#     did_you_mean_offered, dictionary_overflow, lexicon_reloaded,
+#     lexicon_unreadable.
+#   * ``nlp.dispatcher.v1``  — slot resolver + bus dispatch (§10.6);
+#     emits kinds: slot_resolution_failed.
+#   * ``nlp.answer.v1``      — assembles the Turkish-language answer;
+#     emits: humanizer_disabled, humanizer_breaker_open.
+#   * ``nlp.proofreader.v1`` — post-block PII-clean path;
+#     emits: proofreader_blocked, pii_in_answer_redacted.
+NLP_EVENT_V1_ALLOWED_PRODUCERS: FrozenSet[str] = frozenset({
+    "nlp.intent.v1",
+    "nlp.dispatcher.v1",
+    "nlp.answer.v1",
+    "nlp.proofreader.v1",
+})
+
+# `nlp.alert.v1` producers (Phase 10 §10.0 wire-authority).
+#
+# Same bounded set as nlp.event.v1 — the alert channel and the event
+# channel share the same producer tier (§10.0 boundary discipline).
+NLP_ALERT_V1_ALLOWED_PRODUCERS: FrozenSet[str] = frozenset({
+    "nlp.intent.v1",
+    "nlp.dispatcher.v1",
+    "nlp.answer.v1",
+    "nlp.proofreader.v1",
+    "nlp.abuse.v1",
+    "nlp.gossip_aggregator.v1",
+})
+
+# `nlp.gossip.v1` producers (Phase 10.32.12 gossip diagnostics).
+#
+# Bounded to Phase 10 NLP plane agents. Any new producer must be
+# added here with a tracker row + minor bump.
+NLP_GOSSIP_V1_ALLOWED_PRODUCERS: FrozenSet[str] = frozenset({
+    "nlp.intent.v1",
+    "nlp.dispatcher.v1",
+    "nlp.answer.v1",
+    "nlp.proofreader.v1",
+})
+
+# Consumers are bounded to the gossip aggregator plus telemetry.
+NLP_GOSSIP_V1_ALLOWED_CONSUMERS: FrozenSet[str] = frozenset({
+    "nlp.gossip_aggregator.v1",
+    "telemetry.v1",
+})
+
+
+__all__ = [
+    "API_TOPIC_V1_ALLOWED_PRODUCERS",
+    "MAINT_EVENT_V1_ALLOWED_PRODUCERS",
+    "NLP_ALERT_V1_ALLOWED_PRODUCERS",
+    "NLP_EVENT_V1_ALLOWED_PRODUCERS",
+    "NLP_GOSSIP_V1_ALLOWED_PRODUCERS",
+    "NLP_GOSSIP_V1_ALLOWED_CONSUMERS",
+    "PREDICT_CANCEL_V1_ALLOWED_PRODUCERS",
+    "SEC_ALERT_V1_ALLOWED_KINDS_BY_PRODUCER",
+    "SEC_ALERT_V1_ALLOWED_PRODUCERS",
+    "SEC_CONFIG_V1_ALLOWED_PRODUCERS",
+]

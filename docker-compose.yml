@@ -1,0 +1,188 @@
+# ─────────────────────────────────────────────────────────
+#  Negelir — Full Development Stack (fast = default)
+#
+#  Env values come from xops/env/.env (template:
+#  xops/env/.env.example). Each service uses `env_file:` so this
+#  file stays free of value duplication; the only inline overrides
+#  are container-internal hostnames and a single hard guard for the
+#  Postgres password.
+#
+#  Usage: `make up`  (auto-loads xops/env/.env via --env-file).
+#         Raw `docker compose` calls must pass --env-file xops/env/.env.
+# ─────────────────────────────────────────────────────────
+
+services:
+  # ── PostgreSQL ────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    env_file:
+      - ./xops/env/.env
+    environment:
+      # Hard guard: refuse to boot without an explicit password.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in xops/env/.env (no default; see xops/env/.env.example)}
+    command:
+      - postgres
+      - -c
+      - fsync=off
+      - -c
+      - synchronous_commit=off
+      - -c
+      - full_page_writes=off
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - max_connections=200
+      - -c
+      - wal_level=minimal
+      - -c
+      - max_wal_senders=0
+      - -c
+      - checkpoint_timeout=30min
+      - -c
+      - checkpoint_completion_target=0.9
+    ports:
+      - "5432:5432"
+    tmpfs:
+      - /var/lib/postgresql/data:rw,size=1g
+    volumes:
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Redis ─────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --tcp-keepalive
+      - "60"
+      - --io-threads
+      - "2"
+      - --aclfile
+      - /etc/redis/acl.conf
+    volumes:
+      - ./infra/redis/acl.conf:/etc/redis/acl.conf:ro
+    ports:
+      - "6379:6379"
+    tmpfs:
+      - /data:rw,size=512m
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Go Middleware Server ──────────────────────────────
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${SERVER_PORT:-8080}:${SERVER_PORT:-8080}"
+    env_file:
+      - ./xops/env/.env
+    environment:
+      # Container-internal hostnames (override the host-side defaults
+      # that .env carries for `python -m ...` outside Docker).
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      LOG_LEVEL: ${SERVER_LOG_LEVEL:-debug}
+      # Hard guard mirrored here so the server fails fast too.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in xops/env/.env (no default; see xops/env/.env.example)}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./data:/data
+
+  # ── Phase 9 REST API ─────────────────────────────────
+  #  Default profile (no `profiles:` key — always active).
+  #  Run in isolation: `make api.up` / `make api.down`.
+  #  Dev mTLS CA is mounted from infra/mock/ca/; prod-like runs
+  #  override this volume with ./data/api/tls:/certs:ro.
+  api:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "9091:9091"
+    env_file:
+      - ./xops/env/.env
+    environment:
+      # Container-internal hostnames.
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      SERVER_PORT: "8080"
+      NEGELIR_TELEMETRY_METRICS_PORT: "9091"
+      GIN_MODE: release
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in xops/env/.env (no default; see xops/env/.env.example)}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./infra/mock/ca:/certs:ro
+      - ./data:/data
+
+  # ── Swagger UI (docs profile only — NOT in production) ─
+  api-docs:
+    image: swaggerapi/swagger-ui:v5.17.14
+    profiles:
+      - docs
+    ports:
+      - "8081:8080"
+    environment:
+      SWAGGER_JSON: /openapi/openapi.yaml
+      # Disable the default petstore URL so only the mounted spec is shown.
+      BASE_URL: /
+    volumes:
+      - ./server/api/openapi.yaml:/openapi/openapi.yaml:ro
+    # No network dependencies — purely static UI.
+    restart: "no"
+
+  # ── AI Engine ─────────────────────────────────────────
+  ai:
+    build:
+      context: ./ai
+      dockerfile: Dockerfile
+    env_file:
+      - ./xops/env/.env
+    environment:
+      # Container-internal hostnames + fixed runtime knobs.
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      SERVER_URL: http://server:8080
+      PYTHONUNBUFFERED: "1"
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in xops/env/.env (no default; see xops/env/.env.example)}
+    depends_on:
+      server:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./data:/data

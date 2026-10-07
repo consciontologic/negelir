@@ -1,0 +1,67 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# ── Go ──
+server/server
+server/tmp/
+*.exe
+
+# ── Data (mounted volumes) ──
+# data/
+# !data/.gitkeep
+
+# ── Environment ──
+# Real env file lives at xops/env/.env; the .example sibling is tracked.
+# xops/env/.env
+# Legacy locations (in case anyone resurrects them):
+# .env
+
+# ── IDE ──
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Docker ──
+docker-compose.override.yml
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+
+# ── Models (too large for git) ──
+*.onnx
+*.tflite
+*.xgb
+*.lgb
+#*.pkl
+
+# ── Logs ──
+*.log
+logs/
+
+# ── CodeGraph (local semantic-index, dev tooling) ──
+# .codegraph/config.json + .codegraph/.gitignore are committed (define
+# what gets indexed); the SQLite DB and caches are machine-local. The
+# inner .codegraph/.gitignore handles the DB; we ignore stale Node
+# scratch only.
+.codegraph/cache/
+.codegraph/*.db
+.codegraph/*.db-wal
+.codegraph/*.db-shm
+
+
+# Phase orchestration runtime state (xops/orchestrator/)
+.orchestrator/
+
+# Runtime maint artifacts
+data/maint/summarizer_ledger.json
+.venv/

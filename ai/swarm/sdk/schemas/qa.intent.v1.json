@@ -1,0 +1,313 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "negelir/swarm/qa.intent.v1",
+  "title": "qa.intent.v1",
+  "description": "Phase 10 §10.0 wire authority: published by nlp.intent.v1 after sec-pass + normalize (§10.1) + intent-classify (§10.4) + entity-extract (§10.5). Consumer = nlp.dispatcher.v1. Carries the closed-enum intent, entity spans, calibrated intent distribution, and model versions for post-hoc audit. Mirrors ai/swarm/agents/nlp/payloads.py::QaIntentV1.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "request_id",
+    "qa_correlation_id",
+    "intent",
+    "intent_confidence",
+    "entities",
+    "intent_distribution",
+    "intent_model_version",
+    "intent_calibration_version",
+    "lexicon_versions",
+    "normalized_text",
+    "confusables_resolved_count",
+    "locale",
+    "resolved_at_utc"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Envelope schema version for qa.intent.v1; v5 after Phase 10.31 additive pragmatic_class addition."
+    },
+    "request_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Round-trips from qa.request.v1."
+    },
+    "qa_correlation_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Generated at §10.6 dispatch; round-trips through predict.request.v1 → predict.approved.v1 → qa.answer.v1."
+    },
+    "conversation_id": {
+      "type": ["string", "null"],
+      "description": "Optional conversation identifier carried from qa.request.v1 for follow-up context." 
+    },
+    "request_metadata": {
+      "type": "object",
+      "description": "Optional request metadata preserved from qa.request.v1 for downstream NLP provenance.",
+      "properties": {
+        "input_source": {
+          "type": ["string", "null"],
+          "enum": ["keyboard", "voice", "paste", "unknown", null]
+        },
+        "keyboard_hint": {
+          "type": ["string", "null"],
+          "enum": ["q", "f", "swipe", "unknown", null]
+        },
+        "preview": {
+          "type": ["boolean", "null"],
+          "description": "Operator preview mode flag carried from the originating request."
+        },
+        "user_preferences": {
+          "type": "object",
+          "properties": {
+            "favorite_team": {
+              "type": ["string", "null"],
+              "description": "Optional favorite team canonical ID from the user's profile."
+            }
+          },
+          "additionalProperties": false
+        },
+        "shout": {
+          "type": ["boolean", "null"],
+          "description": "Optional signal that the original request was an ALL-CAPS shout."
+        },
+        "stripped_tail": {
+          "type": "string",
+          "description": "Trimmed copy/paste tail removed from the normalized input for audit tracing."
+        }
+      },
+      "additionalProperties": false
+    },
+    "intent": {
+      "type": "string",
+      "enum": [
+        "predict.match_outcome",
+        "predict.match_outcome.conditional",
+        "predict.over_under",
+        "predict.btts",
+        "predict.handicap",
+        "predict.score_grid",
+        "data.fixture_lookup",
+        "data.kickoff_time",
+        "data.standings",
+        "data.head_to_head",
+        "data.top_scorer",
+        "data.assist_leader",
+        "data.clean_sheets_leader",
+        "data.table_leader",
+        "data.relegation_zone",
+        "data.lineup_probable",
+        "data.live_state",
+        "data.lineup_official",
+        "data.injury_list",
+        "data.suspension_list",
+        "data.referee_appointment",
+        "data.weather_at_kickoff",
+        "data.transfer_window_status",
+        "data.head_to_head_history",
+        "data.player_card_risk",
+        "summary.next_week",
+        "summary.matchday",
+        "meta.help",
+        "meta.social_media_unverifiable",
+        "meta.unsupported",
+        "meta.modality_unsupported",
+        "meta.counterfactual_probe",
+        "meta.adversarial"
+      ],
+      "description": "Classified intent. Mirrors _intent_enum.json (§10.4)."
+    },
+    "intent_confidence": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "description": "Calibrated confidence for the top-1 intent (§10.4)."
+    },
+    "entities": {
+      "type": "array",
+      "description": "Extracted entity spans from §10.5 gazetteer + CRF pass.",
+      "items": {
+        "type": "object",
+        "required": [
+          "span_start",
+          "span_end",
+          "kind",
+          "canonical_id",
+          "confidence",
+          "source"
+        ],
+        "properties": {
+          "span_start": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "span_end": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "team",
+              "player",
+              "league",
+              "competition",
+              "market",
+              "date",
+              "time",
+              "weekday",
+              "ordinal",
+              "money_amount",
+              "score"
+            ]
+          },
+          "canonical_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Null for CRF structural kinds (date/time/etc.)."
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "gazetteer",
+              "crf"
+            ],
+            "description": "Entity extraction source (§10.5)."
+          },
+          "lexicon_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Null for CRF-sourced spans."
+          },
+          "original_text": {
+            "type": "string",
+            "description": "§10.21.5: Original user-typed text before confusables fold, preserved for audit when folded differs from raw. Omit if no confusables were resolved for this span."
+          },
+          "syntactic_role": {
+            "type": "string",
+            "enum": ["entity_subject", "entity_object", "ambiguous"],
+            "description": "Optional syntactic role inferred from verbal-no / nominalisation constructions for downstream dispatcher routing."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "intent_distribution": {
+      "type": "array",
+      "description": "Top-k calibrated intent probabilities (Platt-scaled, §10.4).",
+      "items": {
+        "type": "object",
+        "required": [
+          "intent",
+          "probability"
+        ],
+        "properties": {
+          "intent": {
+            "type": "string"
+          },
+          "probability": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "intent_model_version": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Semver of the fastText intent model (§10.4)."
+    },
+    "intent_calibration_version": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Semver of the Platt scaling calibration file (§10.4)."
+    },
+    "lexicon_versions": {
+      "type": "object",
+      "description": "Per-file lexicon versions loaded at resolve-time (§10.2).",
+      "properties": {
+        "teams": {
+          "type": "string"
+        },
+        "players": {
+          "type": "string"
+        },
+        "leagues": {
+          "type": "string"
+        },
+        "competitions": {
+          "type": "string"
+        },
+        "markets": {
+          "type": "string"
+        },
+        "dialects": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "normalized_text": {
+      "type": "string",
+      "description": "Post-§10.1-normalize text; omit raw input (PII boundary)."
+    },
+    "intent_modifier": {
+      "description": "Optional intent modifier that augments the classified intent.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": ["none", "conditional", "comparative", "sarcastic"]
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["conditional", "comparative", "sarcastic"]
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      ]
+    },
+    "pragmatic_class": {
+      "type": "string",
+      "enum": ["information_seeking", "confirmation_seeking"],
+      "description": "Optional question-tag pragmatic class for confirmation-seeking vs information-seeking questions."
+    },
+    "query_style": {
+      "description": "Optional query styling metadata for special input modes.",
+      "type": "string",
+      "enum": ["natural", "search", "quoted_exact_search"],
+      "default": "natural"
+    },
+    "quotative_frame_class": {
+      "type": ["string", "null"],
+      "description": "Optional quotative frame class detected during NLP normalization."
+    },
+    "confusables_resolved_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "§10.21.5: Count of entities where confusables-fold changed the matched text (audit metric)."
+    },
+    "locale": {
+      "type": "string",
+      "enum": ["tr-TR"],
+      "description": "Echoed from qa.request.v1.locale (§10.17). v1 ships tr-TR only; designed to additively gain en-GB/en-US post-Phase-13a."
+    },
+    "resolved_at_utc": {
+      "type": "string",
+      "description": "ISO-8601 UTC timestamp when intent was resolved."
+    }
+  },
+  "additionalProperties": false
+}

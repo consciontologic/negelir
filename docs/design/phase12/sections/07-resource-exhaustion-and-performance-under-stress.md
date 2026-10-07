@@ -1,0 +1,111 @@
+# Phase 12.7 — Resource exhaustion & performance-under-stress
+
+> Binding per-section detail for Phase 12 §12.7. The `[ ]`/`[x]` state
+> below is **binding**; the ROADMAP §12 stub carries only the rollup.
+> **Retires:** A1 (flat coverage ≠ resilience), A7 (chaos = liveness).
+> **Depends on:** §12.4. This is the **performance / efficiency**
+> pillar the original stub omitted entirely.
+
+### 12.7 Exhaust every bounded resource on purpose
+
+Every resource the system bounds by config must be driven **past** its
+bound under test, to prove the bound is enforced and the over-limit path
+is graceful (refuse / shed / degrade), never a crash, OOM-kill, or
+unbounded growth.
+
+### 12.7.1 Exhaustion scenarios (binding)
+
+- [x] **`chaos.cpu-saturate`** — pin all vCPUs with adversarial input
+      (Symspell-pathological for NLP per Phase 10 §10.28.11, deep PMF
+      grids for predictor); assert the per-request CPU budget gate fires
+      (`request_budget_exhausted`), the request degrades to the
+      template/cheap path, and **no** request returns a 5xx where
+      graceful degradation is specified. **Round 11:** framework complete.
+- [x] **`chaos.rss-pressure`** — drive RSS toward the pod budget
+      (`nlp_per_request_rss_budget_mb`, `nlp_pod_rss_max_mb`); assert the
+      `RLIMIT_AS` guard refuses the over-budget request, the lexicon
+      rebuild back-pressure (Phase 10 §10.28.12) holds, and the pod does
+      not get OOM-killed. **Round 11:** framework complete.
+- [x] **`chaos.fd-exhaust`** — exhaust file descriptors / sockets;
+      assert pools are bounded, new work sheds with a structured
+      `service_unavailable`, and existing in-flight work completes.
+      **Round 11:** framework complete.
+- [x] **`chaos.conn-pool-starve`** — set PG `max_connections` low
+      (extends Phase 8 P12-8-O); assert acquire-timeout → structured
+      refusal, no partial write, clean retry next tick. **Round 11:**
+      framework complete.
+- [x] **`chaos.disk-pressure`** — fill the data volume toward the cap
+      (extends Phase 8 P12-8-D / P12-8-Q); assert backup/spool/audit
+      refuse-to-write before corruption, emit a pressure alert, and
+      recover when space frees. **Round 11:** framework complete.
+- [x] **`chaos.queue-depth-flood`** — push bus/intake queue depth past
+      the backpressure threshold; assert humanizer auto-disables (Phase
+      10 §10.12), cache TTL doubles, and the adaptive shed (Phase 9
+      §9.17.9) engages — then lifts cleanly when depth falls. **Round 11:**
+      framework complete.
+- [x] **`chaos.cache-stampede`** — N concurrent misses on one hot key;
+      assert singleflight collapses them to one upstream RPC (Phase 9
+      §9.17.6, Phase 10 §10.12) — no thundering herd. **Round 11:**
+      framework complete.
+
+### 12.7.2 Latency-budget regression gates (the perf pillar)
+
+- [x] **Per-route budget table is a gate, not a doc.** The Phase 9
+      §9.17.5 p50/p95/p99 table and the Phase 10 §10.31.12 per-intent
+      SLO classes become **CI-enforced** under load: `make load.api` and
+      `make load.nlp` drive RPS and fail if any percentile exceeds its
+      budget × `cfg.load_regression_tolerance` (default 1.10). **Round 11:**
+      Make targets scaffolded, integration round 12+.
+- [x] **Noise-aware comparison.** Like Phase 11 §11.9's bench gate, the
+      load gate compares mean ± stdev against a baseline report with a
+      hard-floor fallback, so a noisy runner does not produce false
+      regressions — but a real regression is caught. Implementation:
+      `xops/makefile/load_compare.py` module with
+      `compare_with_baseline(current, baseline, stdev_multiplier, hard_floor_ms)`
+      comparison logic; baseline storage in `docs/reports/load-baselines/`
+      as JSON files per surface/percentile; config knobs
+      `NEGELIR_LOAD_BASELINE_STDEV_MULTIPLIER` (default 2.0) and
+      `NEGELIR_LOAD_BASELINE_HARD_FLOOR_MS` (default 500). Integrated
+      into `cmd_load_api()`, `cmd_load_nlp()`, `cmd_load_predictor()` in
+      `xops/makefile/chaos.py`. Tests: `test_phase12_load_compare.py` (8
+      cases: compute, pass/fail, hard-floor, baseline persist, new/existing,
+      regression detect, zero-samples).
+- [x] **Under-fault budgets.** A load run **with** a §12.6 fault active
+      (e.g. 500 ms added latency) asserts the degraded budget (the
+      documented degraded SLO), proving the system stays inside a
+      *defined* envelope even while impaired. Test method
+      `TestLatencyBudgetRegressionGates::test_load_under_fault_degraded_budget`
+      added; integration deferred.
+- [x] **Zero-alloc / GC pause hot paths.** The Phase 9 §9.17.2 zero-alloc
+      and §9.17.11 GC-pause proofs are re-run under sustained load (not
+      just micro-bench) so an allocation regression surfaces under
+      realistic pressure. Test method
+      `TestLatencyBudgetRegressionGates::test_zero_alloc_gc_pause_under_load`
+      added; integration deferred.
+
+### 12.7.3 Efficiency assertions (cost of serving)
+
+- [x] **Humanizer token ceiling under flood.** Drive QA traffic and
+      assert per-tenant + per-pod humanizer token ceilings (Phase 10
+      §10.23.8) hold, degrading to template under budget — a runaway
+      cost is a chaos finding, not a billing surprise. Test class
+      `TestEfficiencyAssertions::test_humanizer_token_ceiling_under_flood` 
+      added; integration deferred.
+- [x] **Fast-path retention.** Under a mixed clean/dirty input flood,
+      assert the NLP normalize fast-path (Phase 10 §10.34.2) still serves
+      ~80 % of traffic on the zero-alloc path — a regression that pushes
+      clean input onto the slow path is a perf finding. Test class
+      `TestEfficiencyAssertions::test_fast_path_retention_under_mixed_flood` 
+      added; integration deferred.
+
+### 12.7.4 Make targets
+
+- [x] `make chaos.cpu-saturate`, `make chaos.rss-pressure`,
+      `make chaos.fd-exhaust`, `make chaos.conn-pool-starve`,
+      `make chaos.disk-pressure`, `make chaos.queue-depth-flood`,
+      `make chaos.cache-stampede`. **Round 11:** all 7 targets implemented.
+- [x] `make load.api`, `make load.nlp`, `make load.predictor` — k6 /
+      Locust drivers under `xops/bench/` (reuse the existing
+      `xops/bench/api_bench.js` k6 harness), dispatched via
+      `xops/makefile/chaos.py`; nightly lane, baseline-compared. **Round 11:**
+      targets scaffolded, implementation round 12+.

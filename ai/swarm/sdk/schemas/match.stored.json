@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "negelir/swarm/match.stored",
+  "title": "match.stored",
+  "description": "Phase 4.4: storage agent confirmation. Mirrors `ai/swarm/agents/payloads.py::MatchStored`.",
+  "type": "object",
+  "required": [
+    "record_id",
+    "record_type",
+    "plane",
+    "source",
+    "stable_id",
+    "change_kind"
+  ],
+  "properties": {
+    "record_id":   { "type": "integer", "minimum": 1 },
+    "record_type": { "type": "string", "enum": ["fixture", "match_detail", "lineup", "odds"] },
+    "plane":       { "type": "string", "enum": ["reference", "schedule", "live", "editorial", "market"] },
+    "source":      { "type": "string", "enum": ["mackolik", "nesine", "tff", "openfootball"] },
+    "stable_id":   { "type": "string" },
+    "change_kind": { "type": "string", "enum": ["created", "updated", "unchanged"] },
+    "stored_at":   { "type": "string", "description": "ISO-8601 UTC." }
+  },
+  "additionalProperties": false
+}

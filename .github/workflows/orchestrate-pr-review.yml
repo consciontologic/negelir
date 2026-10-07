@@ -1,0 +1,269 @@
+name: orchestrate-pr-review
+
+# Auto-review + auto-merge loop for agent PRs.
+#
+# Triggered when the Copilot Coding Agent (or any other implementer)
+# opens or pushes to a PR on an `agent/**` branch. Runs the
+# phase-pr-reviewer agent which:
+#   1. Verifies scope, doctrine, tests, checkboxes, tracker rows, and
+#      anti-stop compliance against the PR diff.
+#   2. Runs the §4 gauntlet (lint + test.ai + test + version.validate
+#      + git_guard + changed_files_audit) via xops/ci/run_gauntlet.sh.
+#   3. On clean: approves and enables auto-merge (squash, delete
+#      branch). Branch protection on `main` makes the actual merge
+#      gated on this same workflow being green.
+#   4. On findings: posts an inline review with `gh pr review
+#      --request-changes` and re-tags @copilot so the implementer
+#      pushes a fix; the next `synchronize` event re-triggers this
+#      workflow.
+#
+# AGENTS.md Rule 9 CI carve-out applies: this workflow runs only when
+# $GITHUB_ACTIONS == 'true' on an `agent/**` branch, and the merge is
+# `gh pr merge --squash --auto --delete-branch` (ff-only equivalent
+# enforced by branch protection). No force-push, no rebase of main,
+# no tag creation.
+#
+# See `.github/instructions/ci-pipeline.instructions.md` §4 for the
+# gauntlet definition and §10 for the PR review loop contract.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, closed]
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: write
+  checks: read
+
+concurrency:
+  group: orchestrate-pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review-and-merge:
+    # Only react to PRs from `agent/**` branches. Human PRs are
+    # reviewed by humans. Also skips the `closed` event — that is
+    # handled by the `continue-full-roadmap` job below.
+    if: |
+      github.event.action != 'closed' &&
+      startsWith(github.event.pull_request.head.ref, 'agent/') &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ secrets.MASTER_TOKEN }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+      PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          token: ${{ secrets.MASTER_TOKEN }}
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Configure git identity (read-only use)
+        run: |
+          git config user.name  "negelir-orchestrator[bot]"
+          git config user.email "negelir-orchestrator[bot]@users.noreply.github.com"
+
+      - name: Extract phase id from PR title
+        id: phase
+        run: |
+          set -euo pipefail
+          TITLE=$(gh pr view "$PR_NUMBER" --json title -q .title)
+          # PR titles look like: "agent: Phase 10.4 — ..."
+          PHASE_ID=$(echo "$TITLE" | sed -nE 's/^agent: Phase ([0-9]+(\.[0-9]+)?)\b.*/\1/p')
+          if [[ -z "$PHASE_ID" ]]; then
+            echo "::warning::could not parse phase id from PR title: $TITLE"
+            PHASE_ID="unknown"
+          fi
+          echo "phase_id=$PHASE_ID" >>"$GITHUB_OUTPUT"
+          echo "phase id: $PHASE_ID"
+
+      - name: Install xops requirements (for git_guard + version CLI)
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade pip
+          if [[ -f xops/requirements.txt ]]; then
+            python3 -m pip install -r xops/requirements.txt
+          fi
+          if [[ -f ai/requirements.txt ]]; then
+            python3 -m pip install -r ai/requirements.txt
+          fi
+
+      - name: Run §4 gauntlet
+        id: gauntlet
+        run: |
+          set +e
+          bash xops/ci/run_gauntlet.sh 2>gauntlet.stderr
+          echo "rc=$?" >>"$GITHUB_OUTPUT"
+          # Always surface stderr in the workflow log.
+          cat gauntlet.stderr >&2 || true
+
+      - name: Build review body
+        id: review_body
+        run: |
+          set -euo pipefail
+          PHASE_ID="${{ steps.phase.outputs.phase_id }}"
+          GAUNTLET_RC="${{ steps.gauntlet.outputs.rc }}"
+          {
+            echo "# Phase ${PHASE_ID} — automated PR review"
+            echo
+            echo "Reviewed by \`phase-pr-reviewer\` on commit \`${PR_HEAD_SHA}\`."
+            echo
+            if [[ "$GAUNTLET_RC" == "0" ]]; then
+              echo "## §4 gauntlet"
+              echo
+              echo "All gates green: \`lint\`, \`test.ai\`, \`test\`, \`version.validate\`, \`git_guard --check-commit HEAD\`, \`changed_files_audit\`."
+            else
+              echo "## §4 gauntlet — RED"
+              echo
+              echo "One or more gates failed. Full stderr below:"
+              echo
+              echo '```'
+              cat gauntlet.stderr || true
+              echo '```'
+              echo
+              echo "## Required fixes"
+              echo
+              echo "Address each red gate above. Push the fix to this branch; this workflow will re-review on the next push."
+              echo
+              echo "Per AGENTS.md Rule 11, do **not** stop after fixing one gate — drain every remaining \`- [ ]\` in the phase slice in the same push."
+            fi
+          } >/tmp/review.md
+          cat /tmp/review.md
+
+      - name: Request changes (gauntlet red)
+        if: steps.gauntlet.outputs.rc != '0'
+        run: |
+          set -euo pipefail
+          gh pr review "$PR_NUMBER" --request-changes --body-file /tmp/review.md
+          gh pr comment "$PR_NUMBER" \
+            --body "@copilot please address the §4 gauntlet failures above and push fixes to this branch. The PR review workflow will re-review automatically on the next push."
+          echo "review: requested changes (gauntlet red); waiting for next push" >&2
+
+      - name: Approve and enable auto-merge (gauntlet green)
+        if: steps.gauntlet.outputs.rc == '0'
+        run: |
+          set -euo pipefail
+          gh pr review "$PR_NUMBER" --approve --body-file /tmp/review.md
+          gh pr merge "$PR_NUMBER" \
+            --squash --auto --delete-branch \
+            || {
+              echo "::warning::auto-merge enablement failed; PR remains open for human merge"
+              exit 0
+            }
+          echo "review: approved + auto-merge enabled" >&2
+
+      - name: Fail the workflow if gauntlet was red
+        if: steps.gauntlet.outputs.rc != '0'
+        run: |
+          echo "::error::§4 gauntlet failed — PR cannot merge until fixes are pushed"
+          exit 1
+
+  # ── Full-roadmap chain: fire the next phase when a PR merges ──────────────
+  continue-full-roadmap:
+    # Runs ONLY on the `closed` event and only when the PR was actually merged
+    # (not when it was closed without merge). Scoped to agent/** branches so
+    # human PRs never trigger this job.
+    #
+    # The job reads the active full-roadmap cursor (if any), marks the merged
+    # phase as complete, and re-dispatches orchestrate-full-roadmap.yml for
+    # the next phase. If the cursor is empty the loop is done.
+    if: |
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.head.ref, 'agent/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ secrets.MASTER_TOKEN }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.MASTER_TOKEN }}
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "negelir-orchestrator[bot]"
+          git config user.email "negelir-orchestrator[bot]@users.noreply.github.com"
+
+      - name: Extract phase id from merged PR
+        id: phase
+        run: |
+          set -euo pipefail
+          TITLE="${{ github.event.pull_request.title }}"
+          BRANCH="${{ github.event.pull_request.head.ref }}"
+          # Try PR title first (agent: Phase 10.4 — ...)
+          PHASE_ID=$(echo "$TITLE" | sed -nE 's/^agent: Phase ([0-9]+(\.[0-9]+)?)\b.*/\1/p')
+          # Fall back to branch name (agent/phase-10.4-...)
+          if [[ -z "$PHASE_ID" ]]; then
+            PHASE_ID=$(echo "$BRANCH" | sed -nE 's|^agent/phase-([0-9]+(\.[0-9]+)?)-.*|\1|p')
+          fi
+          if [[ -z "$PHASE_ID" ]]; then
+            echo "::warning::could not extract phase id from title '$TITLE' or branch '$BRANCH'"
+          fi
+          echo "phase_id=$PHASE_ID" >>"$GITHUB_OUTPUT"
+          echo "merged phase: $PHASE_ID (branch: $BRANCH)"
+
+      - name: Check for active full-roadmap cursor
+        id: cursor
+        run: |
+          set -euo pipefail
+          CURSOR_EXISTS=false
+          SESSION_ID=""
+          if [[ -d .orchestrator/full-roadmap ]] && ls .orchestrator/full-roadmap/*.json >/dev/null 2>&1; then
+            CURSOR_EXISTS=true
+            SESSION_ID=$(python3 -m xops.orchestrator.cli full-roadmap-load --json \
+                | python3 -c 'import json,sys; print(json.load(sys.stdin)["session_id"])')
+          fi
+          echo "cursor_exists=$CURSOR_EXISTS" >>"$GITHUB_OUTPUT"
+          echo "session_id=$SESSION_ID"       >>"$GITHUB_OUTPUT"
+          echo "cursor_exists=$CURSOR_EXISTS session_id=$SESSION_ID"
+
+      - name: Skip (no active full-roadmap session)
+        if: steps.cursor.outputs.cursor_exists == 'false'
+        run: |
+          echo "No active full-roadmap cursor — this is a standalone PR merge. Nothing to chain."
+
+      - name: Dispatch next phase via orchestrate-full-roadmap.yml
+        if: |
+          steps.cursor.outputs.cursor_exists == 'true' &&
+          steps.phase.outputs.phase_id != ''
+        run: |
+          set -euo pipefail
+          PHASE_ID="${{ steps.phase.outputs.phase_id }}"
+          SESSION_ID="${{ steps.cursor.outputs.session_id }}"
+          echo "Chaining full-roadmap: phase $PHASE_ID completed, dispatching next phase."
+          gh workflow run orchestrate-full-roadmap.yml \
+            --ref main \
+            -f session_id="$SESSION_ID" \
+            -f completed_phase="$PHASE_ID" \
+            -f model="${{ github.event.inputs.model || 'claude-sonnet-4-5' }}"
+          echo "::notice::Full-roadmap chain dispatched for session $SESSION_ID (completed: $PHASE_ID)"

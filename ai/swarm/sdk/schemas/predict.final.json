@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "negelir/swarm/predict.final",
+  "title": "predict.final",
+  "description": "Phase 5.2: calibrated swarm consensus. Control-plane topic — unversioned by design (ROADMAP §3.7); the proofreader-approved data-plane mirror is `predict.approved.v1`. Single-publication per `(match_id, market, request_id)`. `degraded=true` + `degraded_reason` when fewer than `cfg.consensus_min_voters` predictors voted (Phase 12 contract). `prediction_id` is sha256(match_id|market|request_id|calibration_version)[:32]. Mirrors `ai/swarm/agents/payloads.py::PredictFinal`.",
+  "type": "object",
+  "required": [
+    "request_id",
+    "prediction_id",
+    "match_id",
+    "market",
+    "distribution",
+    "weights",
+    "contributing_models",
+    "calibration_version",
+    "swarm_confidence"
+  ],
+  "properties": {
+    "request_id":          { "type": "string", "minLength": 1 },
+    "prediction_id":       { "type": "string", "minLength": 1 },
+    "match_id":            { "type": "string", "minLength": 1 },
+    "market":              { "type": "string", "enum": ["1x2", "ah", "ou_2_5", "btts"] },
+    "distribution":        { "type": "object", "description": "{market_outcomes: dict[outcome -> prob], score_grid?: list[list[float]] | null}. When present, score_grid is a square 2D matrix where score_grid[home][away] = P(home goals = h, away goals = a); element-wise mean of contributing votes' grids." },
+    "weights":             { "type": "object", "description": "predictor_id → weight used for fusion." },
+    "contributing_models": { "type": "array", "items": { "type": "string" } },
+    "calibration_version": { "type": "integer", "minimum": 0 },
+    "swarm_confidence":    { "type": "number" },
+    "degraded":            { "type": "boolean" },
+    "degraded_reason":     { "type": "string" },
+    "produced_at":         { "type": "string" },
+    "league_id":           { "type": ["string", "null"] },
+    "profile_id":          { "type": ["string", "null"] }
+  },
+  "additionalProperties": false
+}

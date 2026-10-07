@@ -1,0 +1,1214 @@
+"""Phase 8 §8.2 — `maint.scaler.v1` smoke tests."""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from swarm.agents.maint.scaler import MaintScaler, NoopController
+from swarm.agents.topics import MAINT_ACK, MAINT_EVENT, MODEL_TRAINED, SEC_ALERT
+from swarm.sdk.leader import SingleProcessLeader
+from swarm.sdk.types import Envelope, Message
+
+
+def _wrap(payload: dict) -> Message:
+    env = Envelope(
+        message_id="m1",
+        trace_id="t1",
+        topic=MAINT_EVENT,
+        producer="ops_console",
+        created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        schema_version=1,
+        attempt=1,
+    )
+    return Message(envelope=env, payload=payload)
+
+
+def _wrap_sec_alert(payload: dict, *, created_at: str | None = None) -> Message:
+    env = Envelope(
+        message_id="sec-1",
+        trace_id="sec-1",
+        topic=SEC_ALERT,
+        producer=str(payload.get("source") or "maint.scaler.v1"),
+        created_at=created_at or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        schema_version=1,
+        attempt=1,
+    )
+    return Message(envelope=env, payload=payload)
+
+
+def test_subscribes_publishes_set() -> None:
+    a = MaintScaler()
+    assert a.name == "maint.scaler.v1"
+    assert MAINT_EVENT in a.subscribes
+    assert SEC_ALERT in a.subscribes
+    assert MAINT_EVENT in a.publishes
+    assert MAINT_ACK in a.publishes
+    assert SEC_ALERT in a.publishes
+
+
+def test_sec_alert_scale_throttled_records_feedback_subject() -> None:
+    agent = MaintScaler()
+
+    out = list(agent.handle(_wrap_sec_alert({
+        "alert_id": "scale-throttle-1",
+        "kind": "scale_throttled",
+        "severity": "warn",
+        "source": "maint.scaler.v1",
+        "subject": "predictor.elo",
+        "reason": "manual_pin_active",
+        "produced_at": "2024-01-01T00:00:00+00:00",
+    })))
+
+    assert out == []
+    assert "predictor.elo" in agent._sec_feedback_lru
+
+
+def test_sec_plane_tier3_sheds_scaler_sec_feedback(monkeypatch) -> None:
+    from common.config import cfg
+
+    monkeypatch.setattr(cfg, "sec_plane_lag_alert_ms", 5_000, raising=False)
+    monkeypatch.setattr(cfg, "sec_plane_lag_alert_window_s", 1, raising=False)
+
+    now_ns = 1_700_000_300_000_000_000
+    stale = datetime.fromtimestamp(now_ns / 1_000_000_000 - 70.0, tz=timezone.utc).isoformat(timespec="seconds")
+    agent = MaintScaler(clock_ns=lambda: now_ns)
+
+    out = list(agent.handle(_wrap_sec_alert({
+        "alert_id": "scale-throttle-stale",
+        "kind": "scale_throttled",
+        "severity": "warn",
+        "source": "maint.scaler.v1",
+        "subject": "predictor.elo",
+        "reason": "manual_pin_active",
+        "produced_at": "2024-01-01T00:00:00+00:00",
+    }, created_at=stale)))
+
+    assert "predictor.elo" not in agent._sec_feedback_lru
+    throttled = [
+        m for m in out
+        if m.envelope.topic == MAINT_EVENT
+        and m.payload.get("kind") == "maint_plane_throttled"
+        and m.payload.get("tier") == 3
+    ]
+    assert throttled, "expected sec-plane tier-3 shed event for scaler consumer"
+
+
+def test_manual_scale_pin_emits_decision_and_ack() -> None:
+    controller = NoopController()
+    agent = MaintScaler(controller=controller, leader=SingleProcessLeader(name="maint.scaler.v1"))
+    msg = _wrap({
+        "kind": "manual_scale_pin",
+        "request_id": "req-001",
+        "client_id": "ops",
+        "target": "predictor.elo",
+        "replicas": 5,
+        "ttl_s": 60,
+        "produced_at": "2024-01-01T00:00:00+00:00",
+        "reason": "test",
+    })
+    out = list(agent.handle(msg))
+    kinds = [m.payload.get("kind") for m in out]
+    assert "scale_decision" in kinds
+    assert any(m.envelope.topic == MAINT_ACK for m in out)
+    assert ("predictor.elo", 5) in controller.applied
+
+
+def test_non_leader_no_decision_but_acks() -> None:
+    leader = SingleProcessLeader(name="maint.scaler.v1")
+    leader.shed()
+    agent = MaintScaler(leader=leader)
+    out = list(agent.handle(_wrap({
+        "kind": "manual_scale_pin",
+        "request_id": "req-002",
+        "client_id": "ops",
+        "target": "predictor.elo",
+        "replicas": 3,
+        "produced_at": "2024-01-01T00:00:00+00:00",
+        "reason": "x",
+    })))
+    kinds = [m.payload.get("kind") for m in out]
+    assert "scale_decision" not in kinds
+    assert any(m.envelope.topic == MAINT_ACK for m in out)
+
+
+def test_unrelated_kind_emits_maint_unknown_kind() -> None:
+    """§8.9 forward-compat: an unrecognised kind must produce a debounced
+    maint_unknown_kind notification, never a silent empty result."""
+    agent = MaintScaler()
+    out = list(agent.handle(_wrap({"kind": "bogus"})))
+    assert len(out) == 1
+    assert out[0].payload["kind"] == "maint_unknown_kind"
+    assert out[0].payload["unknown_kind"] == "bogus"
+
+
+def test_maint_pause_acks_when_target_matches() -> None:
+    agent = MaintScaler()
+    msgs = list(agent.handle(_wrap({
+        "kind": "maint_pause",
+        "request_id": "req-003",
+        "client_id": "ops",
+        "target": "all",
+        "produced_at": "2024-01-01T00:00:00+00:00",
+        "reason": "rolling",
+    })))
+    assert any(m.envelope.topic == MAINT_ACK for m in msgs)
+
+
+# ── Phase 8.2 gap-fill: per-agent caps, throttle taxonomy, retrain warmup ──
+
+def test_per_agent_max_replicas_override(monkeypatch) -> None:
+    """``maint_scaler_max_replicas_overrides_csv`` lets an operator
+    pin a higher (or lower) ceiling on a single agent."""
+    from common.config import cfg
+    monkeypatch.setattr(cfg, "maint_scaler_max_replicas_overrides_csv",
+                        "predictor.elo=2,trainer.v1=8", raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_max_replicas", 5, raising=False)
+    agent = MaintScaler()
+    assert agent._max_replicas_for("predictor.elo") == 2
+    assert agent._max_replicas_for("trainer.v1") == 8
+    assert agent._max_replicas_for("unmapped.v1") == 5
+
+
+def test_scale_throttled_carries_reason(monkeypatch) -> None:
+    """When the per-target cap is hit, ``tick`` must emit
+    ``scale_throttled`` with a structured ``reason`` field."""
+    from common.config import cfg
+    monkeypatch.setattr(cfg, "maint_scaler_max_replicas_overrides_csv",
+                        "predictor.elo=1", raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 1, raising=False)
+    agent = MaintScaler()
+    # First tick — climbs to the cap (1) since depth >= threshold.
+    out1 = agent.tick({"predictor.elo": {"queue_depth": 100, "in_flight": 0, "head_age_s": 0}})
+    # Force a fresh window so the second tick emits.
+    agent._targets["predictor.elo"].last_window_ns = 0
+    out2 = agent.tick({"predictor.elo": {"queue_depth": 100, "in_flight": 0, "head_age_s": 0}})
+    msgs = [m.payload for m in out1 + out2 if m.payload.get("kind") == "scale_throttled"]
+    assert msgs, "expected at least one scale_throttled when capped"
+    assert any(p.get("reason") == "max_replicas_cap" for p in msgs)
+
+
+def test_pinned_target_emits_throttled_with_manual_pin_active() -> None:
+    """A pinned target must emit a `scale_throttled{manual_pin_active}`
+    on tick rather than silently no-op."""
+    agent = MaintScaler()
+    list(agent.handle(_wrap({
+        "kind": "manual_scale_pin",
+        "request_id": "req-pin",
+        "client_id": "ops",
+        "target": "predictor.elo",
+        "replicas": 3,
+        "ttl_s": 600,
+        "produced_at": "2024-01-01T00:00:00+00:00",
+        "reason": "test",
+    })))
+    out = agent.tick({"predictor.elo": {"queue_depth": 999, "in_flight": 0, "head_age_s": 0}})
+    throttled = [m.payload for m in out if m.payload.get("kind") == "scale_throttled"]
+    assert throttled and throttled[0]["reason"] == "manual_pin_active"
+
+
+def test_decision_window_id_has_pod_instance_id_prefix() -> None:
+    """Decision-window-id must be ``<pod_instance_id>:<anchor_ns>`` so
+    that decisions from different pods never collide in audit logs."""
+    agent = MaintScaler()
+    out = list(agent.handle(_wrap({
+        "kind": "manual_scale_pin",
+        "request_id": "req-w",
+        "client_id": "ops",
+        "target": "predictor.elo",
+        "replicas": 2,
+        "produced_at": "2024-01-01T00:00:00+00:00",
+        "reason": "test",
+    })))
+    decisions = [m.payload for m in out if m.payload.get("kind") == "scale_decision"]
+    assert decisions
+    wid = decisions[0]["decision_window_id"]
+    assert ":" in wid and len(wid.split(":")[0]) == 8
+
+
+def test_retrain_request_warms_trainer_once(monkeypatch) -> None:
+    """Phase 8 §8.14.8: A `retrain_request` must produce a single
+    `trainer_warmup_hint{target=trainer.v1}` (NOT scale_decision). The
+    trainer is the sole writer of its own replica count."""
+    agent = MaintScaler()
+    out = list(agent.handle(_wrap({
+        "kind": "retrain_request",
+        "target": "predictor.elo",
+        "produced_at": "2024-01-01T00:00:00+00:00",
+        "reason": "drift",
+    })))
+    hints = [m.payload for m in out if m.payload.get("kind") == "trainer_warmup_hint"]
+    assert len(hints) == 1, f"expected 1 trainer_warmup_hint, got {len(hints)}"
+    assert hints[0]["target"] == "trainer.v1"
+    assert "retrain_request_id" in hints[0]
+    assert hints[0]["projected_window_s"] > 0
+    # scale_decision must NOT be emitted for trainer.v1
+    bad = [m.payload for m in out if m.payload.get("kind") == "scale_decision"
+           and m.payload.get("target") == "trainer.v1"]
+    assert not bad, "scale_decision must not be emitted for self-scaling trainer.v1"
+
+
+def test_retrain_request_dedup_skips_duplicate(monkeypatch) -> None:
+    """Phase 8 §8.14.8: Re-handling the SAME envelope (same message_id)
+    must not re-emit trainer_warmup_hint — the dedup LRU keys on
+    envelope.message_id × target."""
+    agent = MaintScaler()
+    msg = _wrap({
+        "kind": "retrain_request",
+        "target": "predictor.elo",
+        "produced_at": "2024-01-01T00:00:00+00:00",
+        "reason": "drift",
+    })
+    first = list(agent.handle(msg))
+    second = list(agent.handle(msg))
+    assert any(m.payload.get("kind") == "trainer_warmup_hint" for m in first)
+    assert not any(m.payload.get("kind") == "trainer_warmup_hint" for m in second)
+
+
+# ── §8.2 final gap-fill: payload shape, runtime, hysteresis, VRAM, counters ──
+
+def test_scale_decision_payload_includes_prev_next_reason_observed(monkeypatch) -> None:
+    """ROADMAP §8.2 binding contract: every ``scale_decision`` carries
+    ``prev``, ``next``, ``reason``, ``observed`` alongside the legacy
+    ``replicas/source/signals`` keys (additive — back-compat preserved)."""
+    from common.config import cfg
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 1, raising=False)
+    agent = MaintScaler()
+    out = agent.tick({"predictor.elo": {"queue_depth": 100, "in_flight": 0, "head_age_s": 0}})
+    decisions = [m.payload for m in out if m.payload.get("kind") == "scale_decision"]
+    assert decisions
+    p = decisions[0]
+    for k in ("prev", "next", "reason", "observed", "decision_window_id"):
+        assert k in p, f"missing {k!r} in {p!r}"
+    assert p["next"] == p["replicas"]  # additive, not replacement
+    assert p["reason"] in {"queue_depth_high", "head_age_high", "queue_depth_low",
+                           "manual_pin"}
+
+
+def test_min_decision_interval_throttles_back_to_back(monkeypatch) -> None:
+    """A second decision for the same target inside
+    ``min_decision_interval_s`` must emit ``scale_throttled``."""
+    from common.config import cfg
+    monkeypatch.setattr(cfg, "maint_scaler_min_decision_interval_s", 60, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 1, raising=False)
+    agent = MaintScaler()
+    out1 = agent.tick({"predictor.elo": {"queue_depth": 99, "in_flight": 0, "head_age_s": 0}})
+    assert any(m.payload.get("kind") == "scale_decision" for m in out1)
+    # Force a fresh decision-window — but min_decision_interval_s
+    # must still gate the second emission.
+    agent._targets["predictor.elo"].last_window_ns = 0
+    out2 = agent.tick({"predictor.elo": {"queue_depth": 99, "in_flight": 0, "head_age_s": 0}})
+    throttled = [m.payload for m in out2 if m.payload.get("kind") == "scale_throttled"]
+    assert any(p.get("reason") == "min_decision_interval" for p in throttled)
+
+
+def test_global_max_replicas_throttles_aggregate(monkeypatch) -> None:
+    """Sum of desired replicas across the roster cannot exceed the
+    global cap. The over-cap target emits ``scale_throttled``."""
+    from common.config import cfg
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 1, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_max_changes_per_window", 10, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_global_max_replicas", 2, raising=False)
+    agent = MaintScaler()
+    # Pre-populate one target at replicas=2 so the next scale-up
+    # would push the projected roster total to 3 > 2.
+    agent._evict_and_get("trainer.v1").last_replicas = 2
+    out = agent.tick({"predictor.elo": {"queue_depth": 99, "in_flight": 0, "head_age_s": 0}})
+    throttled = [m.payload for m in out if m.payload.get("kind") == "scale_throttled"]
+    assert any(p.get("reason") == "global_max_replicas" for p in throttled)
+
+
+def test_vram_budget_exceeded_blocks_scale_up(monkeypatch) -> None:
+    """A device probe that reports near-full VRAM must throttle the
+    scale-up with ``vram_budget_exceeded``.
+
+    §8.16.8 Fallback policy: the registered footprint hint (not the
+    device-probe's ``vram_per_replica_mb``) drives the projection.
+    """
+    from common.config import cfg
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 1, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_vram_headroom_mb", 512, raising=False)
+    agent = MaintScaler()
+    # Register a 2000 MB footprint so the projection is exact (§8.16.8).
+    agent.register_model_vram_hint(
+        "predictor.elo",
+        vram_footprint_mb=2000,
+        device_class="gpu_inference",
+    )
+    agent.update_device_probe(
+        "predictor.elo",
+        vram_total_mb=8192,
+        vram_used_mb=7000,
+        vram_per_replica_mb=2000,
+    )
+    out = agent.tick({"predictor.elo": {"queue_depth": 99, "in_flight": 0, "head_age_s": 0}})
+    throttled = [m.payload for m in out if m.payload.get("kind") == "scale_throttled"]
+    assert any(p.get("reason") == "vram_budget_exceeded" for p in throttled)
+
+
+def test_vram_telemetry_stale_fail_safe(monkeypatch) -> None:
+    """A probe older than 5 decision windows must throttle as
+    ``vram_telemetry_stale`` rather than silently allowing the
+    scale-up."""
+    from common.config import cfg
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 1, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_decision_window_ms", 1000, raising=False)
+    agent = MaintScaler()
+    # Inject a probe with observed_at_ns far in the past.
+    agent.update_device_probe(
+        "predictor.elo",
+        vram_total_mb=16384,
+        vram_used_mb=1000,
+        vram_per_replica_mb=1000,
+        observed_at_ns=1,  # ancient
+    )
+    out = agent.tick({"predictor.elo": {"queue_depth": 99, "in_flight": 0, "head_age_s": 0}})
+    throttled = [m.payload for m in out if m.payload.get("kind") == "scale_throttled"]
+    assert any(p.get("reason") == "vram_telemetry_stale" for p in throttled)
+
+
+def test_phase8_16_8_per_model_footprint_admit_small_refuse_large(monkeypatch) -> None:
+    """§8.16.8 proof (a): per-model hints drive VRAM decisions.
+
+    With an 8GB budget, a 50MB model can grow from 99→100, while a
+    4000MB model must refuse 1→2.
+    """
+    from common.config import cfg
+
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 1, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_vram_headroom_mb", 0, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_max_replicas", 256, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_global_max_replicas", 256, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_max_changes_per_window", 10, raising=False)
+
+    agent = MaintScaler()
+
+    # Small-footprint target: should admit 99 -> 100.
+    agent.register_model_vram_hint(
+        "pred.small.v1",
+        vram_footprint_mb=50,
+        device_class="gpu_inference",
+    )
+    agent.update_device_probe(
+        "pred.small.v1",
+        vram_total_mb=8000,
+        vram_used_mb=1000,
+        vram_per_replica_mb=1024,
+    )
+    agent._evict_and_get("pred.small.v1").last_replicas = 99
+    out_small = agent.tick(
+        {"pred.small.v1": {"queue_depth": 99, "in_flight": 0, "head_age_s": 0}}
+    )
+    decisions_small = [
+        m.payload
+        for m in out_small
+        if m.payload.get("kind") == "scale_decision"
+    ]
+    assert any(p.get("next") == 100 for p in decisions_small)
+
+    # Large-footprint target: should refuse 1 -> 2.
+    agent.register_model_vram_hint(
+        "pred.large.v1",
+        vram_footprint_mb=4000,
+        device_class="gpu_inference",
+    )
+    agent.update_device_probe(
+        "pred.large.v1",
+        vram_total_mb=8000,
+        vram_used_mb=5000,
+        vram_per_replica_mb=1024,
+    )
+    agent._evict_and_get("pred.large.v1").last_replicas = 1
+    out_large = agent.tick(
+        {"pred.large.v1": {"queue_depth": 99, "in_flight": 0, "head_age_s": 0}}
+    )
+    throttled_large = [
+        m.payload
+        for m in out_large
+        if m.payload.get("kind") == "scale_throttled"
+    ]
+    assert any(p.get("reason") == "vram_budget_exceeded" for p in throttled_large)
+
+
+def test_phase8_16_8_unknown_footprint_tight_budget_refuses(monkeypatch) -> None:
+    """§8.16.8 proof (b): unknown footprint + tight budget refuses."""
+    from common.config import cfg
+
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 1, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_vram_headroom_mb", 0, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_vram_pessimistic_threshold_pct", 0.6, raising=False)
+    monkeypatch.setattr(cfg, "predictor_max_vram_mb", 1024, raising=False)
+
+    agent = MaintScaler()
+    agent.update_device_probe(
+        "pred.unknown.tight.v1",
+        vram_total_mb=8000,
+        vram_used_mb=7000,
+        vram_per_replica_mb=0,
+    )
+    agent._evict_and_get("pred.unknown.tight.v1").last_replicas = 1
+
+    out = agent.tick(
+        {"pred.unknown.tight.v1": {"queue_depth": 99, "in_flight": 0, "head_age_s": 0}}
+    )
+    throttled = [
+        m.payload
+        for m in out
+        if m.payload.get("kind") == "scale_throttled"
+    ]
+    assert any(p.get("reason") == "vram_footprint_unknown" for p in throttled)
+
+
+def test_phase8_16_8_unknown_footprint_plentiful_budget_admits_with_info_alert(
+    monkeypatch,
+) -> None:
+    """§8.16.8 proof (c): unknown footprint can admit under low pressure,
+    but emits one-shot info alert.
+    """
+    from common.config import cfg
+    from swarm.agents.topics import SEC_ALERT
+
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 1, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_vram_headroom_mb", 0, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_vram_pessimistic_threshold_pct", 0.6, raising=False)
+    monkeypatch.setattr(cfg, "predictor_max_vram_mb", 1024, raising=False)
+
+    agent = MaintScaler()
+    agent.update_device_probe(
+        "pred.unknown.loose.v1",
+        vram_total_mb=8000,
+        vram_used_mb=1000,
+        vram_per_replica_mb=0,
+    )
+    agent._evict_and_get("pred.unknown.loose.v1").last_replicas = 1
+
+    out = agent.tick(
+        {"pred.unknown.loose.v1": {"queue_depth": 99, "in_flight": 0, "head_age_s": 0}}
+    )
+    decisions = [m.payload for m in out if m.payload.get("kind") == "scale_decision"]
+    assert decisions, "expected scale_decision under plentiful budget"
+
+    info_alerts = [
+        m.payload
+        for m in out
+        if m.envelope.topic == SEC_ALERT
+        and m.payload.get("kind") == "vram_footprint_unknown"
+    ]
+    assert len(info_alerts) == 1
+    assert info_alerts[0].get("severity") == "info"
+
+
+def _wrap_models_event(payload: dict) -> Message:
+    """Wrap a ``models.events.v1`` payload into a bus Message."""
+    env = Envelope(
+        message_id="me-1",
+        trace_id="me-trace-1",
+        topic=MODEL_TRAINED,
+        producer="trainer.v1",
+        created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        schema_version=1,
+        attempt=1,
+    )
+    return Message(envelope=env, payload=payload)
+
+
+def test_phase8_16_8_doctrine_bus_model_registered_updates_footprint_map(
+    monkeypatch,
+) -> None:
+    """§8.16.8 Doctrine: a ``models.events.v1{kind=model_registered}``
+    bus message arriving at ``handle()`` must populate the per-agent
+    footprint map and be used by the subsequent VRAM projection.
+
+    Scenario: budget = 8000MB, used = 5000MB.  Without the registration,
+    the global fallback (1024MB) would admit 1→2 (budget allows it).
+    WITH a 4000MB registration the projection is
+    5000 + 4000×2 − 4000×1 = 9000 > 8000 → refused.
+    This proves the bus path is wired end-to-end, not just the direct
+    ``register_model_vram_hint`` call.
+    """
+    from common.config import cfg
+
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 1, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_vram_headroom_mb", 0, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_max_replicas", 16, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_global_max_replicas", 16, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_max_changes_per_window", 10, raising=False)
+    monkeypatch.setattr(cfg, "predictor_max_vram_mb", 1024, raising=False)
+
+    agent = MaintScaler()
+    agent.update_device_probe(
+        "pred.bus.large.v1",
+        vram_total_mb=8000,
+        vram_used_mb=5000,
+        vram_per_replica_mb=0,  # no probe-level hint — forces footprint path
+    )
+    agent._evict_and_get("pred.bus.large.v1").last_replicas = 1
+
+    # Send model_registered via the bus.
+    reg_msg = _wrap_models_event({
+        "kind": "model_registered",
+        "agent_id": "pred.bus.large.v1",
+        "version": "v2",
+        "vram_footprint_mb": 4000,
+        "device_class": "gpu_inference",
+    })
+    result = list(agent.handle(reg_msg))
+    assert result == [], "model_registered must produce no output messages"
+
+    # Verify footprint map is populated.
+    assert "pred.bus.large.v1" in agent._model_vram_hints
+    assert agent._model_vram_hints["pred.bus.large.v1"]["vram_footprint_mb"] == 4000.0
+
+    # Verify the per-version registry.
+    assert agent._footprint_versions["pred.bus.large.v1"]["v2"]["vram_footprint_mb"] == 4000.0
+
+    # Tick: budget 8000, used 5000, next=2 replicas, footprint 4000 each.
+    # Projection: (5000 - 4000×1) + 4000×2 = 1000 + 8000 = 9000 > 8000 → refused.
+    out = agent.tick(
+        {"pred.bus.large.v1": {"queue_depth": 99, "in_flight": 0, "head_age_s": 0}}
+    )
+    throttled = [
+        m.payload for m in out if m.payload.get("kind") == "scale_throttled"
+    ]
+    assert any(p.get("reason") == "vram_budget_exceeded" for p in throttled), (
+        "expected vram_budget_exceeded after bus-registered 4000MB footprint"
+    )
+
+
+def test_phase8_16_8_doctrine_set_active_model_version(monkeypatch) -> None:
+    """§8.16.8 Doctrine: ``set_active_model_version`` switches the active
+    hint to a previously-registered version.
+
+    Register v1 (50MB) and v2 (4000MB) via bus; activate v1 via
+    ``set_active_model_version``; assert scale-up is admitted on the
+    50MB footprint despite the 4000MB v2 being registered.
+    """
+    from common.config import cfg
+
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 1, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_vram_headroom_mb", 0, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_max_replicas", 16, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_global_max_replicas", 16, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_max_changes_per_window", 10, raising=False)
+
+    agent = MaintScaler()
+    agent.update_device_probe(
+        "pred.ver.v1",
+        vram_total_mb=8000,
+        vram_used_mb=1000,
+        vram_per_replica_mb=0,
+    )
+    agent._evict_and_get("pred.ver.v1").last_replicas = 1
+
+    # Register both versions via bus.
+    agent.handle(_wrap_models_event({
+        "kind": "model_registered",
+        "agent_id": "pred.ver.v1",
+        "version": "v1",
+        "vram_footprint_mb": 50,
+        "device_class": "gpu_inference",
+    }))
+    agent.handle(_wrap_models_event({
+        "kind": "model_registered",
+        "agent_id": "pred.ver.v1",
+        "version": "v2",
+        "vram_footprint_mb": 4000,
+        "device_class": "gpu_inference",
+    }))
+    # Latest registration (v2=4000MB) is now the active hint.
+    assert agent._model_vram_hints["pred.ver.v1"]["vram_footprint_mb"] == 4000.0
+
+    # Activate v1 (50MB) — simulates heartbeat saying "I'm running v1".
+    swapped = agent.set_active_model_version("pred.ver.v1", "v1")
+    assert swapped is True
+    assert agent._model_vram_hints["pred.ver.v1"]["vram_footprint_mb"] == 50.0
+
+    # Tick: with 50MB footprint and 7000MB remaining budget, 1→2 must admit.
+    out = agent.tick(
+        {"pred.ver.v1": {"queue_depth": 99, "in_flight": 0, "head_age_s": 0}}
+    )
+    decisions = [m.payload for m in out if m.payload.get("kind") == "scale_decision"]
+    assert any(p.get("next") == 2 for p in decisions), (
+        "expected scale_decision next=2 after activating 50MB version"
+    )
+
+
+def test_phase8_16_8_fallback_probe_draw_not_used_when_no_hint(
+    monkeypatch,
+) -> None:
+    """§8.16.8 Fallback policy (adversarial): when no model_registered hint is
+    present, the device-probe's ``vram_per_replica_mb`` is NOT used as a silent
+    footprint estimate.
+
+    With a tight budget (used > threshold) the scaler must refuse with
+    ``vram_footprint_unknown``, NOT ``vram_budget_exceeded``.  The probe's
+    4000 MB per-replica field, if used, would produce a much larger
+    projection and a different throttle reason — this asserts it is ignored.
+    """
+    from common.config import cfg
+
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 1, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_vram_headroom_mb", 0, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_vram_pessimistic_threshold_pct", 0.6, raising=False)
+    monkeypatch.setattr(cfg, "predictor_max_vram_mb", 100, raising=False)
+
+    agent = MaintScaler()
+    # probe_draw=4000 present but NO model hint — tight budget triggers threshold.
+    agent.update_device_probe(
+        "pred.no.hint.tight.v1",
+        vram_total_mb=8000,
+        vram_used_mb=7000,  # > 0.6 × 8000 = 4800 → tight
+        vram_per_replica_mb=4000,  # must NOT be used as footprint estimate
+    )
+    agent._evict_and_get("pred.no.hint.tight.v1").last_replicas = 1
+
+    out = agent.tick(
+        {"pred.no.hint.tight.v1": {"queue_depth": 99, "in_flight": 0, "head_age_s": 0}}
+    )
+    throttled = [m.payload for m in out if m.payload.get("kind") == "scale_throttled"]
+    reasons = {p.get("reason") for p in throttled}
+    assert "vram_footprint_unknown" in reasons, (
+        f"expected vram_footprint_unknown (probe_draw must be ignored), got {reasons}"
+    )
+    assert "vram_budget_exceeded" not in reasons
+
+
+def test_phase8_16_8_fallback_probe_draw_plentiful_emits_alert(
+    monkeypatch,
+) -> None:
+    """§8.16.8 Fallback policy: unknown footprint + probe_draw > 0 + plentiful
+    budget admits the scale-up AND still emits the one-shot info alert.
+
+    The probe's per-replica field must NOT suppress the vram_footprint_unknown
+    alert — the alert fires whenever model_registered has not been received.
+    """
+    from common.config import cfg
+    from swarm.agents.topics import SEC_ALERT
+
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 1, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_vram_headroom_mb", 0, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_vram_pessimistic_threshold_pct", 0.6, raising=False)
+    monkeypatch.setattr(cfg, "predictor_max_vram_mb", 100, raising=False)
+
+    agent = MaintScaler()
+    # Plentiful budget (1000 << 0.6 × 8000 = 4800); probe_draw present but NO hint.
+    agent.update_device_probe(
+        "pred.no.hint.loose.v1",
+        vram_total_mb=8000,
+        vram_used_mb=1000,
+        vram_per_replica_mb=500,  # must NOT suppress the vram_footprint_unknown alert
+    )
+    agent._evict_and_get("pred.no.hint.loose.v1").last_replicas = 1
+
+    out = agent.tick(
+        {"pred.no.hint.loose.v1": {"queue_depth": 99, "in_flight": 0, "head_age_s": 0}}
+    )
+    decisions = [m.payload for m in out if m.payload.get("kind") == "scale_decision"]
+    assert decisions, "expected scale_decision under plentiful budget"
+
+    info_alerts = [
+        m.payload
+        for m in out
+        if m.envelope.topic == SEC_ALERT
+        and m.payload.get("kind") == "vram_footprint_unknown"
+    ]
+    assert len(info_alerts) == 1, (
+        "expected exactly one vram_footprint_unknown info alert even when probe_draw > 0"
+    )
+    assert info_alerts[0].get("severity") == "info"
+
+
+def test_metrics_snapshot_increments_on_decision(monkeypatch) -> None:
+    """Every emitted scale_decision must increment a labelled counter."""
+    from common.config import cfg
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 1, raising=False)
+    agent = MaintScaler()
+    assert agent.metrics_snapshot() == {}
+    agent.tick({"predictor.elo": {"queue_depth": 99, "in_flight": 0, "head_age_s": 0}})
+    snap = agent.metrics_snapshot()
+    assert snap, "expected at least one counter after a decision"
+    assert any(k.startswith("maint_scaler_scale_decision_total") for k in snap)
+
+
+def test_observability_metrics_cover_phase8_2_contract(monkeypatch) -> None:
+    """Phase 8.2 observability contract: decisions counter + desired
+    replicas gauge + VRAM budget gauge + runtime histogram."""
+    from common.config import cfg
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 1, raising=False)
+    agent = MaintScaler()
+    agent.update_device_probe(
+        "predictor.elo",
+        vram_total_mb=8192,
+        vram_used_mb=2048,
+        vram_per_replica_mb=512,
+        host="host-a",
+    )
+    agent.tick({"predictor.elo": {"queue_depth": 99, "in_flight": 0, "head_age_s": 0}})
+    snap = agent.metrics_snapshot()
+    assert (
+        "maint_scaler_decisions_total"
+        "{agent=maint.scaler.v1,reason=queue_depth_high,outcome=applied}"
+    ) in snap
+    assert "maint_scaler_desired_replicas{agent=predictor.elo}" in snap
+    assert "maint_scaler_vram_budget_mb{host=host-a}" in snap
+    assert (
+        "maint_scaler_runtime_call_seconds_count"
+        "{controller=noop,outcome=success}"
+    ) in snap
+
+
+def test_idempotent_at_most_one_decision_per_window_under_redelivery(monkeypatch) -> None:
+    """Phase 8.9 DoD — at-least-once redelivery idempotency.
+
+    Calling ``tick()`` twice within the same decision window (same
+    clock value → same window anchor) must produce exactly one
+    ``scale_decision`` per target.  The window guard in
+    :meth:`MaintScaler.tick` (``last_window_ns >= window_anchor``)
+    absorbs duplicate signals that arrive under at-least-once bus
+    redelivery semantics.
+
+    v1 restart note (per §8.9 DoD): the first 1–2 windows after a
+    process restart may double-publish because the new
+    ``pod_instance_id`` prefix makes the new ``decision_window_id``
+    unique while the window clock may still be in the same wall-clock
+    slot as the pre-restart process.  This is an accepted v1 edge case;
+    the Postgres audit ledger at Phase 9 absorbs the collision via
+    ``(agent, decision_window_id)`` dedup on ingest.
+    """
+    from common.config import cfg
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 1, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_decision_window_ms", 10_000, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_min_decision_interval_s", 0, raising=False)
+
+    # Fixed clock: epoch + 15 s, inside a 10 s-wide window whose anchor is 10 s.
+    # window_anchor_ns(10_000, now_ns=15_000_000_000) = 10_000_000_000
+    # Using a non-zero anchor is essential: the default _TargetState.last_window_ns
+    # is 0, so an anchor of 0 would falsely satisfy the guard (0 >= 0 → skip).
+    ns: list[int] = [15_000_000_000]
+    agent = MaintScaler(clock_ns=lambda: ns[0])
+
+    signals = {"predictor.elo": {"queue_depth": 99, "in_flight": 0, "head_age_s": 0}}
+
+    # First delivery of the signal → must emit exactly one scale_decision.
+    out1 = agent.tick(signals)
+    decisions1 = [m.payload for m in out1 if m.payload.get("kind") == "scale_decision"]
+    assert len(decisions1) == 1, "first tick must emit exactly one scale_decision"
+    wid1 = decisions1[0]["decision_window_id"]
+    assert wid1 == f"{agent._pod_instance_id}:10000000000"
+
+    # Re-delivery at same clock (same window anchor) → must be suppressed.
+    out2 = agent.tick(signals)
+    decisions2 = [m.payload for m in out2 if m.payload.get("kind") == "scale_decision"]
+    assert len(decisions2) == 0, (
+        "redelivery within the same window must not double-emit scale_decision"
+    )
+
+    # Advance clock to the next window → fresh window → fresh decision.
+    # window_anchor_ns(10_000, now_ns=25_000_000_000) = 20_000_000_000
+    ns[0] = 25_000_000_000
+    out3 = agent.tick(signals)
+    decisions3 = [m.payload for m in out3 if m.payload.get("kind") == "scale_decision"]
+    assert len(decisions3) == 1, "next window must emit a fresh scale_decision"
+    wid3 = decisions3[0]["decision_window_id"]
+    assert wid3 != wid1, "window IDs must differ across distinct windows"
+    assert wid3 == f"{agent._pod_instance_id}:20000000000"
+
+
+def test_compose_controller_invokes_subprocess(tmp_path) -> None:
+    """ComposeController must shell out to ``docker compose --scale``
+    and surface the exit code."""
+    from swarm.agents.maint.runtime import ComposeController
+    compose = tmp_path / "docker-compose.yml"
+    compose.write_text("services: {}\n", encoding="utf-8")
+    calls: list[list[str]] = []
+
+    class _Result:
+        returncode = 0
+        stderr = ""
+
+    def fake_runner(cmd, **kw):  # noqa: ANN001
+        calls.append(list(cmd))
+        return _Result()
+
+    ctl = ComposeController(compose_file=str(compose), timeout_s=5.0)
+    ctl._runner = fake_runner  # type: ignore[assignment]
+    assert ctl.apply("predictor.elo", 3) is True
+    assert calls and calls[0][0] == "docker"
+    assert "--scale" in calls[0]
+    assert "predictor.elo=3" in calls[0]
+
+
+def test_compose_controller_refuses_missing_file() -> None:
+    """Boot validation: the controller must refuse to construct when
+    the compose file does not exist on disk."""
+    import pytest
+    from swarm.agents.maint.runtime import ComposeController
+    with pytest.raises(FileNotFoundError):
+        ComposeController(compose_file="/nonexistent/docker-compose.yml")
+
+
+def test_runtime_factory_selects_noop_by_default(monkeypatch) -> None:
+    """``cfg.maint_runtime=none`` (default) must yield NoopController."""
+    from common.config import cfg
+    from swarm.agents.maint.runtime import NoopController, make_runtime_controller
+    monkeypatch.setattr(cfg, "maint_runtime", "none", raising=False)
+    assert isinstance(make_runtime_controller(), NoopController)
+
+
+def test_runtime_factory_refuses_k8s_until_phase_14(monkeypatch) -> None:
+    """``cfg.maint_runtime=k8s`` must refuse loud (no silent fall-back)."""
+    import pytest
+    from common.config import cfg
+    from swarm.agents.maint.runtime import make_runtime_controller
+    monkeypatch.setattr(cfg, "maint_runtime", "k8s", raising=False)
+    with pytest.raises(NotImplementedError):
+        make_runtime_controller()
+
+
+def test_cfg_rejects_unknown_maint_runtime() -> None:
+    """Boot validation: unknown ``maint_runtime`` value must raise.
+
+    We construct a fresh AppConfig on the side and exercise its
+    validator directly so we do NOT mutate the process-wide ``cfg``
+    singleton (which would leak into every later test in the suite).
+    """
+    from common.config import Config
+    side = Config()
+    side.maint_runtime = "kubernetes_v2"  # type: ignore[assignment]
+    issues = side.validate()
+    assert any("maint_runtime" in x for x in issues), \
+        f"expected validator to flag maint_runtime, got: {issues!r}"
+
+
+# ── Phase 8 §8.2 A1 — Welford rolling sketches + scale_down_grace_windows ──
+
+def test_welford_smooths_single_spike(monkeypatch) -> None:
+    """A single spike in queue_depth must NOT trigger scale-up when
+    smoothed by the Welford sketch (window > 1)."""
+    from common.config import cfg
+    monkeypatch.setattr(cfg, "maint_scaler_signal_window_samples", 5, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 50, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_scale_down_queue_depth", 5, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_scale_down_grace_windows", 0, raising=False)
+    agent = MaintScaler()
+    # Four calm windows → mean stays low.
+    for _ in range(4):
+        agent.tick({"a": {"queue_depth": 5, "in_flight": 1, "head_age_s": 0}})
+    # One spike — mean = (5*4 + 200)/5 = 44 < 50 → still no scale-up.
+    out = agent.tick({"a": {"queue_depth": 200, "in_flight": 1, "head_age_s": 0}})
+    kinds = [m.payload.get("kind") for m in out]
+    assert "scale_decision" not in kinds
+
+
+def test_welford_window_zero_falls_back_to_instantaneous(monkeypatch) -> None:
+    """``maint_scaler_signal_window_samples=0`` disables smoothing — a
+    single sample above the threshold MUST trigger scale-up immediately."""
+    from common.config import cfg
+    monkeypatch.setattr(cfg, "maint_scaler_signal_window_samples", 0, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 50, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_scale_down_grace_windows", 0, raising=False)
+    agent = MaintScaler()
+    out = agent.tick({"a": {"queue_depth": 200, "in_flight": 1, "head_age_s": 0}})
+    kinds = [m.payload.get("kind") for m in out]
+    assert "scale_decision" in kinds
+
+
+def test_scale_down_grace_holds_replicas_for_n_windows(monkeypatch) -> None:
+    """A target sitting at >1 replicas must observe grace windows of
+    low load BEFORE the scaler emits the down-scale. Throttle reason
+    on the held windows is `scale_down_grace`."""
+    from common.config import cfg
+    monkeypatch.setattr(cfg, "maint_scaler_signal_window_samples", 1, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 50, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_scale_down_queue_depth", 5, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_scale_down_grace_windows", 2, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_min_decision_interval_s", 0.0, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_decision_window_ms", 1, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_min_replicas", 1, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_hysteresis_windows", 1, raising=False)
+    agent = MaintScaler()
+    # Pre-load: target sitting at 3 replicas so a down-scale is even possible.
+    agent._targets["a"] = agent._evict_and_get("a")
+    agent._targets["a"].last_replicas = 3
+    sig = {"a": {"queue_depth": 1, "in_flight": 0, "head_age_s": 0}}
+    import time
+    out1 = agent.tick(sig); time.sleep(0.005)
+    out2 = agent.tick(sig); time.sleep(0.005)
+    out3 = agent.tick(sig)
+    reasons1 = [m.payload.get("reason") for m in out1 if m.payload.get("kind") == "scale_throttled"]
+    reasons2 = [m.payload.get("reason") for m in out2 if m.payload.get("kind") == "scale_throttled"]
+    kinds3 = [m.payload.get("kind") for m in out3]
+    assert "scale_down_grace" in reasons1
+    assert "scale_down_grace" in reasons2
+    # On the third low window the grace counter is satisfied → real down-scale fires.
+    assert "scale_decision" in kinds3
+    # Streak resets after the down-scale fires.
+    assert agent._targets["a"].low_streak == 3 or agent._targets["a"].last_replicas == 2
+
+
+def test_scale_up_resets_low_streak(monkeypatch) -> None:
+    """A scale-up signal mid-streak resets the consecutive-low-window
+    counter so a subsequent calm window starts the grace clock fresh."""
+    from common.config import cfg
+    monkeypatch.setattr(cfg, "maint_scaler_signal_window_samples", 0, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 50, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_scale_down_queue_depth", 5, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_scale_down_grace_windows", 5, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_min_decision_interval_s", 0.0, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_decision_window_ms", 1, raising=False)
+    agent = MaintScaler()
+    st = agent._evict_and_get("a")
+    st.last_replicas = 4
+    import time
+    agent.tick({"a": {"queue_depth": 1, "in_flight": 0, "head_age_s": 0}}); time.sleep(0.005)
+    agent.tick({"a": {"queue_depth": 1, "in_flight": 0, "head_age_s": 0}}); time.sleep(0.005)
+    assert st.low_streak == 2
+    # Spike triggers scale-up consideration → resets streak.
+    agent.tick({"a": {"queue_depth": 999, "in_flight": 0, "head_age_s": 0}})
+    assert st.low_streak == 0
+
+
+# ── Phase 8 §8.2 A2 — Load-driven clamp formula ──
+
+def test_clamp_formula_steps_toward_desired(monkeypatch) -> None:
+    """When the smoothed load supports many replicas the clamp formula
+    raises the desired count, but the per-window step cap throttles
+    the actual movement (default max_step_per_window=1)."""
+    from common.config import cfg
+    monkeypatch.setattr(cfg, "maint_scaler_signal_window_samples", 0, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_target_load_per_replica", 50, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_max_step_per_window", 1, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 50, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_max_replicas", 16, raising=False)
+    agent = MaintScaler()
+    # Load = 200 → desired = ceil(200/50) = 4, but step cap → +1.
+    out = agent.tick({"a": {"queue_depth": 200, "in_flight": 0, "head_age_s": 0}})
+    decisions = [m for m in out if m.payload.get("kind") == "scale_decision"]
+    assert decisions, f"expected a scale_decision, got {[m.payload for m in out]}"
+    assert decisions[0].payload["next"] == 2  # 1 → 2 (step cap)
+
+
+def test_clamp_formula_step_cap_two(monkeypatch) -> None:
+    """Raising ``maint_scaler_max_step_per_window`` lets the scaler
+    cover more ground per tick."""
+    from common.config import cfg
+    monkeypatch.setattr(cfg, "maint_scaler_signal_window_samples", 0, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_target_load_per_replica", 50, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_max_step_per_window", 3, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 50, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_max_replicas", 16, raising=False)
+    agent = MaintScaler()
+    out = agent.tick({"a": {"queue_depth": 500, "in_flight": 0, "head_age_s": 0}})
+    decisions = [m for m in out if m.payload.get("kind") == "scale_decision"]
+    assert decisions
+    # Load 500 → desired = 10. Current 1 + step 3 = 4.
+    assert decisions[0].payload["next"] == 4
+
+
+def test_clamp_formula_disabled_falls_back_to_step(monkeypatch) -> None:
+    """``maint_scaler_target_load_per_replica=0`` reverts to the legacy
+    ±1-step decision (no clamp formula)."""
+    from common.config import cfg
+    monkeypatch.setattr(cfg, "maint_scaler_signal_window_samples", 0, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_target_load_per_replica", 0, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 50, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_max_replicas", 16, raising=False)
+    agent = MaintScaler()
+    out = agent.tick({"a": {"queue_depth": 500, "in_flight": 0, "head_age_s": 0}})
+    decisions = [m for m in out if m.payload.get("kind") == "scale_decision"]
+    assert decisions
+    assert decisions[0].payload["next"] == 2  # +1 step from default 1
+
+
+# ── Phase 8 §8.9 DoD: bounded global decision history ─────────────────
+
+def test_decision_history_records_decisions(monkeypatch) -> None:
+    """Every ``scale_decision`` emitted by ``tick`` is recorded in
+    ``_decision_history`` keyed by ``"<target>:<decision_window_id>"``."""
+    from common.config import cfg
+    monkeypatch.setattr(cfg, "maint_scaler_signal_window_samples", 0, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 10, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_max_replicas", 8, raising=False)
+    agent = MaintScaler()
+    out = agent.tick({"agentA": {"queue_depth": 50, "in_flight": 0, "head_age_s": 0}})
+    decisions = [m for m in out if m.payload.get("kind") == "scale_decision"]
+    assert decisions, "expected a scale_decision to be emitted"
+    win_id = decisions[0].payload["decision_window_id"]
+    history_key = f"agentA:{win_id}"
+    assert history_key in agent._decision_history
+    entry = agent._decision_history[history_key]
+    assert entry["target"] == "agentA"
+    assert entry["replicas"] == decisions[0].payload["next"]
+    assert entry["prev"] == decisions[0].payload["prev"]
+    assert entry["reason"] == decisions[0].payload["reason"]
+
+
+def test_decision_history_lru_eviction(monkeypatch) -> None:
+    """Once ``_decision_history`` reaches ``_history_max`` entries the
+    oldest (first inserted) entry is evicted on the next insert."""
+    from common.config import cfg
+    monkeypatch.setattr(cfg, "maint_scaler_history_max", 3, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_signal_window_samples", 0, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 1, raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_max_replicas", 32, raising=False)
+
+    agent = MaintScaler()
+
+    def _drive_decision(target: str, qd: int) -> str:
+        """Force a new window anchor so tick always emits, return history key."""
+        if target in agent._targets:
+            agent._targets[target].last_window_ns = 0
+        out = agent.tick({target: {"queue_depth": qd, "in_flight": 0, "head_age_s": 0}})
+        decisions = [m for m in out if m.payload.get("kind") == "scale_decision"]
+        assert decisions, f"expected scale_decision for {target}"
+        win_id = decisions[0].payload["decision_window_id"]
+        return f"{target}:{win_id}"
+
+    hk1 = _drive_decision("t1", 50)
+    hk2 = _drive_decision("t2", 50)
+    hk3 = _drive_decision("t3", 50)
+    # All three fit.
+    assert len(agent._decision_history) == 3
+    assert hk1 in agent._decision_history
+
+    # 4th entry must evict hk1 (oldest).
+    hk4 = _drive_decision("t4", 50)
+    assert len(agent._decision_history) == 3
+    assert hk1 not in agent._decision_history, "oldest entry must have been evicted"
+    assert hk4 in agent._decision_history
+
+
+def test_decision_history_cap_from_cfg(monkeypatch) -> None:
+    """``_history_max`` is derived from ``cfg.maint_scaler_history_max``
+    (default 1024); changing the cfg knob changes the cap."""
+    from common.config import cfg
+    monkeypatch.setattr(cfg, "maint_scaler_history_max", 7, raising=False)
+    agent = MaintScaler()
+    assert agent._history_max == 7
+
+
+def test_decision_history_default_cap_is_1024() -> None:
+    """Default ``maint_scaler_history_max`` in config must be 1024."""
+    from common.config import cfg
+    assert cfg.maint_scaler_history_max == 1024
+
+
+# ── Phase 8 §8.14.8 proof tests ───────────────────────────────────
+
+def test_self_scaling_target_tick_emits_throttled_and_alert(monkeypatch) -> None:
+    """Phase 8 §8.14.8 proof (a): auto-scaler tick on a self-scaling target
+    must emit scale_throttled{reason=self_scaling_target} + a debounced
+    sec.alert{kind=scaler_target_forbidden} and must NOT invoke the
+    runtime controller or emit scale_decision."""
+    from common.config import cfg
+    from swarm.agents.topics import SEC_ALERT
+    monkeypatch.setattr(cfg, "maint_scaler_self_scaling_targets", "trainer.v1", raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 1, raising=False)
+    controller = NoopController()
+    agent = MaintScaler(controller=controller)
+    out = agent.tick({"trainer.v1": {"queue_depth": 999, "in_flight": 0, "head_age_s": 0}})
+    # scale_throttled{reason=self_scaling_target} must be emitted
+    throttled = [m.payload for m in out if m.payload.get("kind") == "scale_throttled"]
+    assert any(p.get("reason") == "self_scaling_target" for p in throttled), (
+        f"expected scale_throttled{{reason=self_scaling_target}}, got throttle reasons: "
+        f"{[p.get('reason') for p in throttled]}"
+    )
+    # sec.alert{kind=scaler_target_forbidden} must be emitted (debounced)
+    alerts = [m.payload for m in out if m.envelope.topic == SEC_ALERT]
+    assert any(a.get("kind") == "scaler_target_forbidden" for a in alerts), (
+        f"expected scaler_target_forbidden alert, got: {[a.get('kind') for a in alerts]}"
+    )
+    # runtime must NOT have been called
+    assert controller.applied == [], (
+        f"runtime must not be invoked for self-scaling targets, got: {controller.applied}"
+    )
+    # scale_decision must NOT be emitted for trainer.v1
+    decisions = [m.payload for m in out if m.payload.get("kind") == "scale_decision"
+                 and m.payload.get("target") == "trainer.v1"]
+    assert not decisions, "scale_decision must not be emitted for self-scaling target"
+
+
+def test_self_scaling_target_alert_debounced_across_ticks(monkeypatch) -> None:
+    """Phase 8 §8.14.8 proof (a, cont): debounce — the sec.alert fires only
+    on the FIRST tick per target per process lifetime. Subsequent ticks
+    must emit scale_throttled but no additional sec.alert."""
+    from common.config import cfg
+    from swarm.agents.topics import SEC_ALERT
+    monkeypatch.setattr(cfg, "maint_scaler_self_scaling_targets", "trainer.v1", raising=False)
+    monkeypatch.setattr(cfg, "maint_scaler_scale_up_queue_depth", 1, raising=False)
+    agent = MaintScaler()
+    out1 = agent.tick({"trainer.v1": {"queue_depth": 999, "in_flight": 0, "head_age_s": 0}})
+    out2 = agent.tick({"trainer.v1": {"queue_depth": 999, "in_flight": 0, "head_age_s": 0}})
+    first_alerts = [m.payload for m in out1 if m.envelope.topic == SEC_ALERT
+                    and m.payload.get("kind") == "scaler_target_forbidden"]
+    second_alerts = [m.payload for m in out2 if m.envelope.topic == SEC_ALERT
+                     and m.payload.get("kind") == "scaler_target_forbidden"]
+    assert len(first_alerts) == 1, "first tick must emit exactly one scaler_target_forbidden alert"
+    assert len(second_alerts) == 0, "subsequent ticks must not re-emit the alert (debounced)"
+    # scale_throttled must still be emitted every tick
+    assert any(m.payload.get("kind") == "scale_throttled" for m in out2), (
+        "scale_throttled must be emitted every tick even after debounce"
+    )
+
+
+def test_retrain_request_emits_trainer_warmup_hint(monkeypatch) -> None:
+    """Phase 8 §8.14.8 proof (b): retrain_request must emit
+    trainer_warmup_hint carrying retrain_request_id and projected_window_s.
+    scale_decision must NOT be emitted for trainer.v1."""
+    agent = MaintScaler()
+    out = list(agent.handle(_wrap({
+        "kind": "retrain_request",
+        "target": "predictor.elo",
+        "request_id": "req-drift-001",
+        "produced_at": "2024-01-01T00:00:00+00:00",
+        "reason": "drift",
+    })))
+    # Must emit exactly one trainer_warmup_hint
+    hints = [m.payload for m in out if m.payload.get("kind") == "trainer_warmup_hint"]
+    assert len(hints) == 1, f"expected 1 trainer_warmup_hint, got {len(hints)}"
+    assert hints[0]["target"] == "trainer.v1"
+    assert hints[0]["retrain_request_id"] == "req-drift-001"
+    assert hints[0]["projected_window_s"] > 0
+    # Must NOT emit scale_decision for trainer
+    bad = [m for m in out if m.payload.get("kind") == "scale_decision"
+           and m.payload.get("target") == "trainer.v1"]
+    assert not bad, "scale_decision must not be emitted for self-scaling target trainer.v1"
+
+
+def test_self_scaling_targets_orphan_check_both_ways(monkeypatch) -> None:
+    """Phase 8 §8.14.8 proof (c): orphan check both ways via
+    report_registered_agents.
+    - Forward: every member of self_scaling_targets that is NOT in the
+      registered set emits scaler_target_forbidden alert.
+    - Backward (positive): members of self_scaling_targets that ARE
+      registered must NOT trigger an alert.
+    """
+    from common.config import cfg
+    from swarm.agents.topics import SEC_ALERT
+    monkeypatch.setattr(
+        cfg, "maint_scaler_self_scaling_targets", "trainer.v1,orphan.v1",
+        raising=False
+    )
+    agent = MaintScaler()
+    # trainer.v1 IS registered; orphan.v1 IS NOT registered
+    out = agent.report_registered_agents({"predictor.elo", "trainer.v1"})
+    alerts = [
+        m.payload for m in out
+        if m.envelope.topic == SEC_ALERT
+        and m.payload.get("kind") == "scaler_target_forbidden"
+    ]
+    subjects = {a.get("subject") for a in alerts}
+    # Forward check: orphan.v1 must be flagged
+    assert "orphan.v1" in subjects, (
+        f"orphan.v1 should be flagged as unregistered self_scaling_target, got {subjects}"
+    )
+    # Backward check: trainer.v1 must NOT be flagged (it IS registered)
+    assert "trainer.v1" not in subjects, (
+        f"trainer.v1 is registered and must not trigger orphan alert, got {subjects}"
+    )
+    # Second call must be a no-op (debounced per target per process)
+    out2 = agent.report_registered_agents({"predictor.elo", "trainer.v1"})
+    alerts2 = [
+        m.payload for m in out2
+        if m.envelope.topic == SEC_ALERT
+        and m.payload.get("kind") == "scaler_target_forbidden"
+    ]
+    assert not alerts2, "duplicate report call must not re-emit the orphan alert"

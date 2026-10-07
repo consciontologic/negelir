@@ -1,0 +1,379 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "negelir/swarm/qa.answer.v1",
+  "title": "qa.answer.v1",
+  "description": "Phase 10 §10.0 wire authority: published by nlp.answer.v1 (direct path) or nlp.proofreader.v1 (post-block/PII-clean path). Consumer = API gateway response stream + cache.v1 + telemetry.v1. Carries the Turkish-language answer, Phase 5 degraded propagation (MUST NOT be silently dropped), tier label for Phase 9 middleware enforcement, and optional citations. Mirrors ai/swarm/agents/nlp/payloads.py::QaAnswerV1.",
+  "type": "object",
+  "required": [
+    "request_id",
+    "qa_correlation_id",
+    "locale",
+    "intent",
+    "answer_text",
+    "answer_format",
+    "degraded",
+    "humanizer_used",
+    "proofreader_status",
+    "emitted_at_utc",
+    "nlp_pipeline_version"
+  ],
+  "properties": {
+    "request_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Original qa.request.v1.request_id."
+    },
+    "qa_correlation_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Dispatch correlation id (§10.6); used for fan-out aggregation."
+    },
+    "schema_version": {
+      "type": "integer",
+      "enum": [1, 2, 3],
+      "description": "Envelope schema version. v2 adds optional compound-answer support via `parts`. v3 adds answer envelope integrity HMAC and canonical body hash."
+    },
+    "envelope_signature_key_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Identifier for the HMAC key used to sign the answer envelope (schema_version 3+)."
+    },
+    "envelope_signature": {
+      "type": "string",
+      "minLength": 64,
+      "description": "HMAC-SHA256 signature over the canonical QA answer envelope (schema_version 3+)."
+    },
+    "body_canonical_sha": {
+      "type": "string",
+      "minLength": 64,
+      "description": "SHA256 of the canonical answer body, used by signature verification (schema_version 3+)."
+    },
+    "kind": {
+      "type": "string",
+      "description": "Optional answer kind for QA answer payloads (e.g. direct, disambiguation, summary, proofreader_blocked, meta.help).",
+      "anyOf": [
+        {
+          "enum": [
+            "direct",
+            "disambiguation",
+            "summary_offer",
+            "summary",
+            "degraded",
+            "predict.timeout",
+            "proofreader_blocked"
+          ]
+        },
+        {
+          "pattern": "^meta\\.[a-z_]+$"
+        }
+      ]
+    },
+    "emitted_at": {
+      "type": "string",
+      "description": "Optional emitted timestamp for the answer envelope; duplicate of emitted_at_utc for compatibility when available."
+    },
+    "locale": {
+      "type": "string",
+      "enum": ["tr-TR"],
+      "description": "Language locale (§10.17). v1 ships tr-TR only; designed to additively gain en-GB/en-US post-Phase-13a."
+    },
+    "intent": {
+      "type": "string",
+      "description": "Echoed intent for audit (matches §10.4 closed enum)."
+    },
+    "answer_text": {
+      "type": "string",
+      "description": "Turkish-language answer string (§10.7 templated + optional §10.8 humanizer)."
+    },
+    "answer_format": {
+      "type": "string",
+      "enum": [
+        "plain",
+        "markdown_safe",
+        "screen_reader",
+        "whatsapp_4096",
+        "sms_160",
+        "tts_neutral"
+      ],
+      "description": "Output format (§10.7). markdown_safe = subset safe for rendering without HTML injection. screen_reader = assistive-technology friendly output."
+    },
+    "degraded": {
+      "type": "boolean",
+      "description": "Propagated from predict.approved.v1{degraded} (§10.0 Phase 5 contract). MUST NOT be silently dropped."
+    },
+    "degraded_reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Propagated from predict.approved.v1.degraded_reason; null when not degraded."
+    },
+    "humanizer_used": {
+      "type": "boolean",
+      "description": "Whether §10.8 humanizer LLM rephrased the template (false = template-only path)."
+    },
+    "proofreader_status": {
+      "type": "string",
+      "enum": [
+        "pass",
+        "blocked",
+        "redacted"
+      ],
+      "description": "§10.9 proofreader outcome. `pass` = clean; `blocked` = gate-fail surfaced; `redacted` = PII removed."
+    },
+    "synthetic_prober": {
+      "type": ["boolean", "null"],
+      "description": "True when this answer is produced in response to a synthetic prober request."
+    },
+    "tier_id_required": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Tier gate label from cfg.nlp_intent_tier_map (§10.0 Phase 20). NLP is tier-blind; enforcement is Phase 9 middleware."
+    },
+    "request_metadata": {
+      "type": "object",
+      "description": "Optional request provenance metadata preserved through answer production.",
+      "properties": {
+        "input_source": {
+          "type": ["string", "null"],
+          "enum": ["keyboard", "voice", "paste", "unknown", null]
+        },
+        "keyboard_hint": {
+          "type": ["string", "null"],
+          "enum": ["q", "f", "swipe", "unknown", null]
+        },
+        "preview": {
+          "type": ["boolean", "null"],
+          "description": "Operator preview mode flag carried from the originating request metadata."
+        },
+        "user_preferences": {
+          "type": "object",
+          "properties": {
+            "favorite_team": {
+              "type": ["string", "null"],
+              "description": "Optional favorite team canonical ID from the user's profile."
+            }
+          },
+          "additionalProperties": false
+        },
+        "shout": {
+          "type": ["boolean", "null"],
+          "description": "Optional signal that the original request was an ALL-CAPS shout."
+        },
+        "stripped_tail": {
+          "type": "string",
+          "description": "Optional copy/paste tail stripped from the request input for audit tracing."
+        },
+        "pragmatic_class": {
+          "type": "string",
+          "enum": ["information_seeking", "confirmation_seeking"],
+          "description": "Optional question-tag pragmatic class preserved from qa.intent.v1 for proofreader prepend logic."
+        }
+      },
+      "additionalProperties": false
+    },
+    "citations": {
+      "type": "array",
+      "description": "Optional citation block per §10.7 (mandatory for predict.* intents).",
+      "items": {
+        "type": "object",
+        "required": [
+          "kind",
+          "produced_at_utc"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "prediction",
+              "fact",
+              "fixture",
+              "source"
+            ],
+            "description": "Citation kind (§10.7)."
+          },
+          "prediction_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Present when kind=prediction; round-trips from predict.approved.v1."
+          },
+          "source_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Present when kind=source; refers to a Phase 4 storage record id."
+          },
+          "produced_at_utc": {
+            "type": "string",
+            "description": "ISO-8601 UTC timestamp when cited artifact was produced."
+          },
+          "model_versions": {
+            "type": "array",
+            "description": "Model version array for kind=prediction (§10.7). Format: predictor_id@semver.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "calibration_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Calibration version semver for kind=prediction (§10.16)."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "disclosures": {
+      "type": "array",
+      "description": "Optional regulatory disclosures appended to predict.* answers.",
+      "items": {
+        "type": "object",
+        "required": [
+          "disclosure_id",
+          "disclosure_version",
+          "disclosure_sha8"
+        ],
+        "properties": {
+          "disclosure_id": {
+            "type": "string",
+            "description": "Closed disclosure identifier."
+          },
+          "disclosure_version": {
+            "type": "integer",
+            "description": "Version number for the disclosure text."
+          },
+          "disclosure_sha8": {
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 8,
+            "description": "Stable short hash of the disclosure text."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "parts": {
+      "type": "array",
+      "description": "Optional compound-answer parts for multi-subquery requests. Legacy consumers may ignore this and use the first part's body as the top-level answer_text.",
+      "items": {
+        "type": "object",
+        "required": [
+          "intent",
+          "body",
+          "citation",
+          "polarity",
+          "subquery_correlation_id"
+        ],
+        "properties": {
+          "intent": {
+            "type": "string",
+            "description": "Intent for the subquery part."
+          },
+          "body": {
+            "type": "string",
+            "description": "Rendered Turkish answer text for the subquery part."
+          },
+          "citation": {
+            "type": "object",
+            "required": [
+              "kind",
+              "produced_at_utc"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "prediction",
+                  "fact",
+                  "fixture",
+                  "source"
+                ],
+                "description": "Citation kind for the subquery part."
+              },
+              "prediction_id": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Optional prediction id for kind=prediction citations."
+              },
+              "source_id": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Optional source id for kind=source citations."
+              },
+              "produced_at_utc": {
+                "type": "string",
+                "description": "ISO-8601 UTC timestamp when the cited artifact was produced."
+              },
+              "model_versions": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Optional predictor model versions for kind=prediction citations."
+              },
+              "calibration_version": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Optional calibration version for kind=prediction citations."
+              }
+            },
+            "additionalProperties": false
+          },
+          "polarity": {
+            "type": "string",
+            "enum": ["affirm", "negate"],
+            "description": "Resolved answer polarity for the subquery part."
+          },
+          "subquery_correlation_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Traceable correlation id for the subquery result."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "streaming_chunks": {
+      "type": "array",
+      "description": "Optional streaming answer chunks emitted by the NLP agent before final assembly (§10.25.2 cache coherence).",
+      "items": {
+        "type": "string"
+      }
+    },
+    "final_answer": {
+      "type": "string",
+      "description": "Optional final answer text that completes a streamed response (§10.25.2 cache coherence)."
+    },
+    "emitted_at_utc": {
+      "type": "string",
+      "description": "ISO-8601 UTC timestamp when answer was emitted (§10.11)."
+    },
+    "nlp_pipeline_version": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Semver of the NLP pipeline (§10.11 audit trail)."
+    },
+    "query_time_bucket": {
+      "type": "string",
+      "description": "Hour-truncated UTC bucket used by the summary top-N cache key."
+    },
+    "feature_set_hash": {
+      "type": "string",
+      "description": "Hash of the resolved summary top-N feature set used for cache key stability."
+    }
+  },
+  "additionalProperties": false
+}

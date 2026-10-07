@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "negelir/swarm/predict.vote",
+  "title": "predict.vote",
+  "description": "Phase 5.1: one predictor's contribution. Control-plane topic — unversioned by design (ROADMAP §3.7) because it is internal swarm traffic, never persisted, and never consumed across release boundaries. `distribution.market_outcomes` is a probability dict that sums to 1.0; `score_grid` is optional (only Dixon-Coles + the XGB pair populate it). Mirrors `ai/swarm/agents/payloads.py::PredictVote`.",
+  "type": "object",
+  "required": [
+    "request_id",
+    "match_id",
+    "market",
+    "predictor_id",
+    "distribution",
+    "confidence"
+  ],
+  "properties": {
+    "request_id":       { "type": "string", "minLength": 1 },
+    "match_id":         { "type": "string", "minLength": 1 },
+    "market":           { "type": "string", "enum": ["1x2", "ah", "ou_2_5", "btts"] },
+    "predictor_id":     { "type": "string", "minLength": 1 },
+    "distribution":     { "type": "object", "description": "{market_outcomes: dict[outcome -> prob], score_grid?: list[list[float]] | null}. When present, score_grid is a square 2D matrix where score_grid[home][away] = P(home goals = h, away goals = a); see ai/swarm/agents/predictors/_grid.py." },
+    "confidence":       { "type": "number" },
+    "produced_at":      { "type": "string" },
+    "features_version": { "type": "string" },
+    "league_id":        { "type": ["string", "null"], "description": "Round-tripped from PredictRequest so consensus + downstream ops can slice without joining by match_id." },
+    "profile_id":       { "type": ["string", "null"], "description": "Round-tripped from PredictRequest; Phase 13a CalibrationProfile id." },
+    "metadata":         { "type": "object" }
+  },
+  "additionalProperties": false
+}

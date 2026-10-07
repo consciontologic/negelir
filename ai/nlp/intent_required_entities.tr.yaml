@@ -1,0 +1,29 @@
+version: 1
+intents:
+  predict.match_outcome:
+    - kind: team
+      count: 2
+    - kind: kickoff_or_recent
+      count: 1
+  data.kickoff_time:
+    - kind: team
+      count: 2
+  data.competition_lookup:
+    - kind: competition
+      count: 1
+  data.transfer_lookup:
+    - kind: team
+      count: 1
+  data.injury_lookup:
+    - kind: team
+      count: 1
+  data.referee_lookup:
+    - kind: team
+      count: 2
+  data.weather_lookup:
+    - kind: team
+      count: 2
+  data.suspension_lookup:
+    - kind: team
+      count: 1
+  meta.help: []

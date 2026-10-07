@@ -1,0 +1,69 @@
+_meta:
+  schema_version: 1
+  generated_by: "phase10_30"
+  description: "Politeness markers and their classes for preprocessing and logging."
+entries:
+  - token: lütfen
+    class: polite
+  - token: rica ederim
+    class: very_polite
+  - token: sağol
+    class: polite
+  - token: teşekkürler
+    class: very_polite
+  - token: acaba
+    class: polite
+  - token: mümkünse
+    class: polite
+  - token: zahmet olmazsa
+    class: polite
+  - token: rica etsem
+    class: polite
+  - token: rica ediyorum
+    class: very_polite
+  - token: mısınız
+    class: polite
+  - token: misiniz
+    class: polite
+  - token: mıydınız
+    class: polite
+  - token: miydiniz
+    class: polite
+  - token: musunuz
+    class: polite
+  - token: müsünüz
+    class: polite
+  - token: misin
+    class: polite
+  - token: mısın
+    class: polite
+  - token: miyim
+    class: polite
+  - token: hadi
+    class: curt
+  - token: hemen
+    class: curt
+  - token: şimdi
+    class: curt
+  - token: çabuk
+    class: curt
+  - token: sen söyle
+    class: curt
+  - token: bak
+    class: curt
+  - token: sorma
+    class: curt
+  - token: yap
+    class: curt
+  - token: hadi ama
+    class: curt
+  - token: kesin şekilde
+    class: polite
+  - token: kibarca
+    class: polite
+  - token: nazikçe
+    class: polite
+  - token: mümkün müdür
+    class: polite
+  - token: rica ederim lütfen
+    class: very_polite

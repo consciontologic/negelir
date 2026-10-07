@@ -1,0 +1,19 @@
+{
+  "3": {
+    "2": [
+      "envelope_signature_key_id",
+      "envelope_signature",
+      "body_canonical_sha",
+      "disclosures"
+    ],
+    "1": [
+      "envelope_signature_key_id",
+      "envelope_signature",
+      "body_canonical_sha",
+      "disclosures"
+    ]
+  },
+  "2": {
+    "1": []
+  }
+}

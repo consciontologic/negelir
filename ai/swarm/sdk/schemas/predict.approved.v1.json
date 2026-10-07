@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "negelir/swarm/predict.approved.v1",
+  "title": "predict.approved.v1",
+  "description": "Phase 6 — proofreader-aggregator output. Emitted exactly once per `prediction_id` when the proofreader quorum (default ⌊N/2⌋+1, N=len(swarm.agents.proofreader.replicas.PROOFREADER_POLICY_CLASSES)) accepts a `predict.final`. The `cache.v1` agent and any user-facing publisher subscribe HERE — never to `predict.final` directly — so a candidate prediction can never reach the API surface without proofreader approval (ROADMAP §736 contract). Carries the full predict.final payload verbatim under `final` so downstream consumers do not need a join. Mirrors `ai/swarm/agents/payloads.py::PredictApproved`.",
+  "type": "object",
+  "required": [
+    "request_id",
+    "prediction_id",
+    "match_id",
+    "market",
+    "approved_at",
+    "approved_by",
+    "verdict_count",
+    "quorum",
+    "final"
+  ],
+  "properties": {
+    "schema_version":     { "type": "integer", "enum": [1, 2, 3], "description": "Payload schema marker. 1 = legacy payload without qa_correlation_id. 2 = additive shape with qa_correlation_id (Phase 10 §10.19). 3 = additive citation_signature and optional calibration_state_horizon fields. When absent, consumers must treat the payload as version 1 for backward compatibility." },
+    "request_id":         { "type": "string", "minLength": 1, "description": "Round-trips from predict.request → predict.final → here." },
+    "prediction_id":      { "type": "string", "minLength": 1, "description": "Deterministic id of the predict.final being approved." },
+    "match_id":           { "type": "string", "minLength": 1 },
+    "market":             { "type": "string", "enum": ["1x2", "ah", "ou_2_5", "btts"] },
+    "qa_correlation_id":  { "type": ["string", "null"], "description": "Optional QA fanout correlation id (Phase 10 §10.19); round-trips from qa.request.v1 through predict.request → predict.final → here. Present when this prediction originated from an NLP QA dispatch." },
+    "approved_at":        { "type": "string", "description": "ISO-8601 UTC timestamp of the aggregator's quorum-met decision." },
+    "approved_by":        { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "description": "Proofreader agent ids (e.g. `proof.sanity.v1`) whose `accept` verdict satisfied quorum." },
+    "verdict_count":      { "type": "integer", "minimum": 1, "description": "Total proofreader verdicts received in the aggregation window." },
+    "quorum":             { "type": "integer", "minimum": 1, "description": "Threshold this prediction crossed (≥ ⌊N/2⌋+1)." },
+    "final":              { "type": "object", "description": "The full predict.final payload, verbatim. Schema = predict.final." },
+    "calibration_version":{ "type": "integer", "minimum": 0, "description": "Echo of final.calibration_version for join-free audit replay." },
+    "calibration_state_horizon": { "type": ["string", "null"], "enum": ["prematch", "live", "both"], "description": "Phase 10 §10.27 additive calibration horizon marker for the predicted fixture state at answer-render time." },
+    "citation_signature": { "type": ["string", "null"], "minLength": 64, "maxLength": 64, "description": "Phase 10 §10.21.8 additive integrity signature: HMAC-SHA256 over (prediction_id || produced_at_utc || model_versions_canonical || calibration_version)." },
+    "citation_key_id":  { "type": ["string", "null"], "pattern": "^[0-9a-f]{16}$", "description": "Phase 10 §10.21.8 additive signing key id for citation_signature (sha256(key_bytes)[:16])." }
+  },
+  "additionalProperties": false
+}
